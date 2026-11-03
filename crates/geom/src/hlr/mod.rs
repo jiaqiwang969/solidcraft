@@ -15,6 +15,7 @@
 //! [`crate::section`]. See `docs/drawing-hlr.md` for the contract and its measured limits.
 
 pub(crate) mod curve;
+pub mod inspect;
 mod silhouette;
 pub(crate) mod surface;
 mod trim;
@@ -186,13 +187,48 @@ pub fn prepare(b: &Brep, opts: &Options) -> Result<Prepared, HlrError> {
     prepare_cancellable(b, opts, &|| false)
 }
 
+fn accuracy_error(a: CurveAccuracy) -> f64 {
+    match a {
+        CurveAccuracy::Analytic => 0.,
+        CurveAccuracy::Bounded { max_deviation_mm } => max_deviation_mm,
+        CurveAccuracy::Sampled { max_sample_deviation_mm } => max_sample_deviation_mm,
+    }
+}
+
+fn combined_accuracy(a: CurveAccuracy, b: CurveAccuracy) -> CurveAccuracy {
+    let error = accuracy_error(a) + accuracy_error(b);
+    match (a, b) {
+        (CurveAccuracy::Sampled { .. }, _) | (_, CurveAccuracy::Sampled { .. }) => CurveAccuracy::Sampled { max_sample_deviation_mm: error },
+        (CurveAccuracy::Bounded { .. }, _) | (_, CurveAccuracy::Bounded { .. }) => CurveAccuracy::Bounded { max_deviation_mm: error },
+        _ => CurveAccuracy::Analytic,
+    }
+}
+
 /// [`prepare`], polling `cancel` between edges, faces and surface comparisons; when it returns
 /// true the call ends with `HlrError::Cancelled`.
 pub fn prepare_cancellable(b: &Brep, opts: &Options, cancel: &dyn Fn() -> bool) -> Result<Prepared, HlrError> {
+    prepare_with_accuracy(b, None, opts, cancel)
+}
+
+/// Prepare a derived drawing body while retaining each edge's producer-declared accuracy.
+/// Entries follow flat portable edge order. A sampled declaration never becomes a bound.
+/// This does not certify the declaration or the source geometry.
+pub fn prepare_with_accuracy(
+    b: &Brep,
+    source_accuracy: Option<&[CurveAccuracy]>,
+    opts: &Options,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Prepared, HlrError> {
     if !(1..=MAX_TRIM_SAMPLES).contains(&opts.trim_samples) {
         return Err(HlrError::Invalid("trim samples"));
     }
     b.validate().map_err(|_| HlrError::Invalid("portable B-rep"))?;
+    if let Some(acc) = source_accuracy
+        && (acc.len() != b.edges.len()
+            || acc.iter().any(|a| !accuracy_error(*a).is_finite() || !(0.0..=MAX_COORDINATE).contains(&accuracy_error(*a))))
+    {
+        return Err(HlrError::Invalid("source edge accuracy"));
+    }
     // Work on the body moved to its own centre: rounding in ray and inversion formulas grows
     // with the coordinates, and a part may be modelled far from the origin (W05a finding 7).
     let offset = anchor(b);
@@ -207,6 +243,7 @@ pub fn prepare_cancellable(b: &Brep, opts: &Options, cancel: &dyn Fn() -> bool) 
             return Err(HlrError::Cancelled);
         }
         let (c, acc) = C3::of_edge(e)?;
+        let acc = source_accuracy.and_then(|v| v.get(ei)).map_or(acc, |source| combined_accuracy(acc, *source));
         let record = match &e.curve {
             crate::brep::Curve::Line { .. } => "line",
             crate::brep::Curve::Circle { .. } => "circle_arc",
@@ -277,7 +314,9 @@ pub fn prepare_cancellable(b: &Brep, opts: &Options, cancel: &dyn Fn() -> bool) 
             }
         }
         *report.surfaces.entry(analytic_name(&analytic).to_string()).or_insert(0) += 1;
-        let trim = trim::build(f, &local_curves, &surface, opts.trim_samples);
+        let mut trim = trim::build(f, &local_curves, &surface, opts.trim_samples);
+        let source_error = trim::uses(f).filter_map(|u| curves.get(u.edge as usize)).map(|(_, a)| accuracy_error(*a)).fold(0., f64::max);
+        trim.chord_error += source_error;
         if let Some(why) = trim.unsupported {
             report.unsupported_trims.push((fi, why.to_string()));
         }
@@ -294,7 +333,7 @@ pub fn prepare_cancellable(b: &Brep, opts: &Options, cancel: &dyn Fn() -> bool) 
         // Every face is padded, planes too: a plane record and its edges may disagree by
         // rounding, and a box flat along the normal would cull the plane's own hit. Rounding
         // grows with where the body was modelled (its offset), not with the face's size.
-        let pad = (hi - lo).len() * 1e-6 + 1e-12 * offset.x.abs().max(offset.y.abs()).max(offset.z.abs());
+        let pad = (hi - lo).len() * 1e-6 + 1e-12 * offset.x.abs().max(offset.y.abs()).max(offset.z.abs()) + source_error;
         lo -= Vec3::new(pad, pad, pad);
         hi += Vec3::new(pad, pad, pad);
         for u in trim::uses(f) {
@@ -481,6 +520,10 @@ pub struct Line {
     /// Index into the scene's placements.
     pub placement: usize,
     pub source: Source,
+    /// Portable face indices used to trim this track and classify its own-face hits.
+    /// For grouped silhouettes these are candidate supports, not an assertion that
+    /// every piece belongs to the first face alone. Engineering scope resolves later.
+    pub support_faces: Vec<usize>,
     pub pieces: Vec<Piece>,
 }
 
@@ -614,20 +657,10 @@ fn context<'a>(defs: &'a [Prepared], scene: &'a [Placement], view: &View, opts: 
     })
 }
 
-pub fn hidden_lines(defs: &[Prepared], scene: &[Placement], view: &View, opts: &Options, cancel: &dyn Fn() -> bool) -> Result<Drawing, HlrError> {
-    // Work in a frame centred on the scene: coordinates stay small, so rounding does not grow
-    // with the distance from the origin (W05a finding 7). Results are shifted back at the end.
-    let origin = scene_centre(defs, scene)?;
-    // Each body's own offset (see `Prepared`) joins its placement here.
-    let local: Vec<Placement> =
-        scene.iter().map(|p| Placement { translation: p.apply(defs.get(p.body).map_or(Vec3::ZERO, |d| d.offset)) - origin, ..*p }).collect();
-    let scene = local.as_slice();
-    let shift = view.screen(origin);
-    let ctx = context(defs, scene, view, opts, cancel)?;
-    let scale = ctx.scale;
-    let mut stats = Stats::default();
-    let mut unsupported = Vec::new();
-    let clock = Clock::start();
+/// Prepare the exact ordered source tracks shared by drawing and bounded diagnostics.
+/// A track index is local to this body/view/options snapshot, not a persistent face ID.
+fn prepare_tracks<'a>(ctx: &Ctx<'a>, opts: &Options, stats: &mut Stats, unsupported: &mut Vec<Unsupported>) -> Result<Vec<Track<'a>>, HlrError> {
+    let (defs, scene, view, cancel) = (ctx.defs, ctx.scene, &ctx.view, ctx.cancel);
     // 1. Tracks: drawable edges and trimmed silhouettes of every placement.
     let mut tracks: Vec<Track> = Vec::new();
     for (pi, p) in scene.iter().enumerate() {
@@ -659,6 +692,7 @@ pub fn hidden_lines(defs: &[Prepared], scene: &[Placement], view: &View, opts: &
                     let base = (1e-9 * ctx.scale).max(1e-6 * size).max(far);
                     match e.acc {
                         CurveAccuracy::Bounded { max_deviation_mm: tol } => base.max(10. * tol),
+                        CurveAccuracy::Sampled { max_sample_deviation_mm: tol } => base.max(10. * tol),
                         _ => base,
                     }
                 },
@@ -726,6 +760,25 @@ pub fn hidden_lines(defs: &[Prepared], scene: &[Placement], view: &View, opts: &
         }
     }
     stats.tracks = tracks.len();
+    Ok(tracks)
+}
+
+pub fn hidden_lines(defs: &[Prepared], scene: &[Placement], view: &View, opts: &Options, cancel: &dyn Fn() -> bool) -> Result<Drawing, HlrError> {
+    // Work in a frame centred on the scene: coordinates stay small, so rounding does not grow
+    // with the distance from the origin (W05a finding 7). Results are shifted back at the end.
+    let origin = scene_centre(defs, scene)?;
+    // Each body's own offset (see `Prepared`) joins its placement here.
+    let local: Vec<Placement> =
+        scene.iter().map(|p| Placement { translation: p.apply(defs.get(p.body).map_or(Vec3::ZERO, |d| d.offset)) - origin, ..*p }).collect();
+    let scene = local.as_slice();
+    let shift = view.screen(origin);
+    let ctx = context(defs, scene, view, opts, cancel)?;
+    let scale = ctx.scale;
+    let mut stats = Stats::default();
+    let mut unsupported = Vec::new();
+    let clock = Clock::start();
+    // 1. Reuse the same ordered native tracks for drawing and inspection.
+    let mut tracks = prepare_tracks(&ctx, opts, &mut stats, &mut unsupported)?;
     // 2. Screen samples.
     for (ti, t) in tracks.iter_mut().enumerate() {
         if ti % 64 == 0 && cancel() {
@@ -785,20 +838,14 @@ pub fn hidden_lines(defs: &[Prepared], scene: &[Placement], view: &View, opts: &
         // Chord sag on screen: exact for lines, measured at the middle for curves; a sampled
         // silhouette's chords stand for the true curve to within its measured deviation.
         // A fitted source record stands for the true curve to within its bound.
-        let fitted = match t.acc {
-            CurveAccuracy::Bounded { max_deviation_mm: tol } => tol,
-            _ => 0.,
-        };
+        let fitted = accuracy_error(t.acc);
         let sags = samples
             .windows(2)
             .map(|w| {
                 fitted
                     + match (c, w.first(), w.get(1)) {
                         (C3::Line { .. }, _, _) => 0.,
-                        (C3::Polyline(_), _, _) => match t.acc {
-                            CurveAccuracy::Sampled { max_sample_deviation_mm: dev } => dev,
-                            _ => 0.,
-                        },
+                        (C3::Polyline(_), _, _) => 0.,
                         (_, Some(a), Some(b)) => {
                             let hull = c
                                 .hull([a.0, b.0])
@@ -921,7 +968,10 @@ pub fn hidden_lines(defs: &[Prepared], scene: &[Placement], view: &View, opts: &
         }
         stats.pieces += pieces.len();
         stats.uncertain_pieces += pieces.iter().filter(|p| p.visibility == Visibility::Uncertain).count();
-        lines.push(Line { placement: t.placement, source: t.source, pieces });
+        let mut support_faces = t.own.clone();
+        support_faces.sort_unstable();
+        support_faces.dedup();
+        lines.push(Line { placement: t.placement, source: t.source, support_faces, pieces });
     }
     stats.phase_ms[2] = clock.lap();
     // Coverage is checked every 1e-4 of the scene (5 um to 0.5 mm): a gap narrower than that
@@ -1736,11 +1786,11 @@ fn classify(t: &Track, x: f64, ctx: &Ctx) -> Result<Visibility, HlrError> {
         return Err(HlrError::Cancelled);
     }
     let own = ctx.scene.get(t.placement).ok_or(HlrError::Invalid("placement"))?;
-    Ok(classify_point(ctx, t.placement, &t.own, t.own_eps, own.apply(t.c3().at(x))))
+    Ok(classify_point(ctx, t.placement, &t.own, t.own_eps, accuracy_error(t.acc), own.apply(t.c3().at(x))))
 }
 
 /// Visibility of a world point on placement `placement` lying on its faces `own`.
-fn classify_point(ctx: &Ctx, placement: usize, own: &[usize], own_eps: f64, world: Vec3) -> Visibility {
+fn classify_point(ctx: &Ctx, placement: usize, own: &[usize], own_eps: f64, source_error: f64, world: Vec3) -> Visibility {
     let screen = ctx.view.screen(world);
     let depth = world.dot(ctx.view.d);
     let toward = -ctx.view.d;
@@ -1748,15 +1798,16 @@ fn classify_point(ctx: &Ctx, placement: usize, own: &[usize], own_eps: f64, worl
     let mut hits: Vec<Hit> = Vec::new();
     for (qi, q) in ctx.scene.iter().enumerate() {
         let Some((slo, shi, dmin)) = ctx.boxes.get(qi) else { continue };
-        let pad = ctx.eps_other;
-        if screen[0] < slo[0] - pad || screen[0] > shi[0] + pad || screen[1] < slo[1] - pad || screen[1] > shi[1] + pad || *dmin > depth {
+        let pad = ctx.eps_other + source_error;
+        if screen[0] < slo[0] - pad || screen[0] > shi[0] + pad || screen[1] < slo[1] - pad || screen[1] > shi[1] + pad || *dmin > depth + pad {
             continue;
         }
         let Some(def) = ctx.defs.get(q.body) else { continue };
         let (p0, dl) = (q.local(world), q.local_dir(toward));
         for (fi, f) in def.faces.iter().enumerate() {
             let is_own = qi == placement && own.contains(&fi);
-            let Some([l0, l1]) = slab(p0, dl, f.lo, f.hi) else { continue };
+            let pad = Vec3::new(source_error, source_error, source_error);
+            let Some([l0, l1]) = slab(p0, dl, f.lo - pad, f.hi + pad) else { continue };
             let eps = if is_own { own_eps } else { ctx.eps_other };
             let range = [l0.max(eps), l1];
             if !(range[1] >= range[0]) {
@@ -1765,6 +1816,11 @@ fn classify_point(ctx: &Ctx, placement: usize, own: &[usize], own_eps: f64, worl
             ctx.surface_tests.set(ctx.surface_tests.get() + 1);
             hits.clear();
             f.surface.ray_as(&f.analytic, p0, dl, range, &mut hits);
+            let sensitive = f.surface.near_contacts(&f.analytic, p0, dl, range, source_error).iter().any(|h| {
+                let tol = 2. * f.trim.chord_error + 1e-7 * (f.hi - f.lo).len();
+                f.trim.near(f.surface.point(h.uv), tol) || f.trim.contains(h.uv) != Some(false)
+            });
+            uncertain |= sensitive;
             for h in &hits {
                 let p = f.surface.point(h.uv);
                 let tol = 2. * f.trim.chord_error + 1e-7 * (f.hi - f.lo).len();
@@ -1780,7 +1836,7 @@ fn classify_point(ctx: &Ctx, placement: usize, own: &[usize], own_eps: f64, worl
                     Some(inside) => {
                         // An unsupported freeform face never hides anything for certain.
                         let unsure = f.freeform && !ctx.freeform;
-                        if inside && (unsure || h.grazing || (!is_own && h.lam < ctx.eps_own)) {
+                        if inside && (unsure || h.grazing || sensitive || (!is_own && h.lam < ctx.eps_own)) {
                             uncertain = true;
                         } else if inside {
                             return Visibility::Hidden;

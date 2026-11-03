@@ -490,3 +490,30 @@ fn corpus_geometry_reads_and_round_trips() {
     }
     assert_eq!(failed, 0);
 }
+
+/// Close knots are distinct even when they fall inside a modelling tolerance.
+#[test]
+fn step_preserves_close_distinct_spline_knots() {
+    use crate::geom::{BSplineCurve, Curve, CurveForm, KnotSpec, Logical};
+    use crate::write::{GeomWriter, Writer};
+    let curve = Curve::BSpline(Box::new(BSplineCurve {
+        degree: 3,
+        points: (0..10).map(|i| [i as f64, 0., 0.]).collect(),
+        weights: None,
+        knots: vec![0., 0.5, 0.5000002, 1.],
+        multiplicities: vec![4, 3, 3, 4],
+        form: CurveForm::Unspecified,
+        closed: Logical::False,
+        self_intersect: Logical::Unknown,
+        knot_spec: KnotSpec::Unspecified,
+    }));
+    let mut writer = Writer::new();
+    let id = GeomWriter::new(&mut writer).curve(&curve);
+    let exchange = crate::p21::parse(&writer.file("close knots", "AUTOMOTIVE_DESIGN")).unwrap();
+    let params = exchange.get(id).unwrap().params();
+    let multiplicities: Vec<_> = params[6].as_list().unwrap().iter().map(|p| p.as_f64().unwrap() as usize).collect();
+    let knots: Vec<_> = params[7].as_list().unwrap().iter().map(|p| p.as_f64().unwrap()).collect();
+    assert_eq!(multiplicities, [4, 3, 3, 4]);
+    assert_eq!(knots, [0., 0.5, 0.5000002, 1.]);
+    assert_eq!(multiplicities.iter().sum::<usize>(), 14);
+}

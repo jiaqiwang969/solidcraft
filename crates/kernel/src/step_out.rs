@@ -312,6 +312,52 @@ mod tests {
     use solidcraft_step::p21;
     use solidcraft_step::write::real;
 
+    /// A transverse circular pocket has an intersection that is on both analytic
+    /// cylinders. Whole-body size must not turn STEP export into a loose fit of it.
+    #[test]
+    fn cross_drilled_cylinder_step_keeps_intersection_on_both_cylinders() {
+        use solidcraft_geom::brep::{Curve, eval::CurveEval};
+        let support_error = |body: &Body| {
+            let mut count = 0;
+            let mut worst = 0.0_f64;
+            let record = crate::brep_record(body).unwrap();
+            for edge in &record.edges {
+                let curve = &edge.curve;
+                // The pocket wall's vertical seam is on only the tool cylinder;
+                // it is not an edge at which the two cylinders intersect.
+                if matches!(curve, Curve::Line { .. }) {
+                    continue;
+                }
+                let [lo, hi] = edge.interval;
+                let evaluated = CurveEval::new(edge.parameters()).unwrap();
+                for k in 1..200 {
+                    let t = lo + (hi - lo) * k as f64 / 200.0;
+                    let p = evaluated.point(t).unwrap();
+                    if (13.9..22.1).contains(&p.x) && p.y.abs() < 4.1 && (9.0..12.1).contains(&p.z) {
+                        count += 1;
+                        worst = worst.max((p.y.hypot(p.z) - 12.0).abs()).max(((p.x - 18.0).hypot(p.y) - 4.0).abs());
+                    }
+                }
+            }
+            assert!(count > 100, "must sample the curved intersection: {count} samples, {} edges", record.edges.len());
+            worst
+        };
+        for length in [80.0, 240.0] {
+            let shaft = crate::cylinder(Vec3::ZERO, Vec3::X, 12.0, length).unwrap();
+            let tool = crate::cylinder(Vec3::new(18.0, 0.0, 8.0), Vec3::Z, 4.0, 20.0).unwrap();
+            let body = crate::boolean(&shaft, &tool, crate::BoolOp::Cut).unwrap().unwrap();
+            let native_error = support_error(&body);
+            assert!(native_error < 2e-5, "native support error {native_error} at length {length}");
+            let text = crate::step_export(&[&body], "analytic intersection regression").unwrap();
+            let imp = crate::step_import(&text).unwrap();
+            assert_eq!(imp.bodies.len(), 1);
+            assert!(imp.bodies[0].closed);
+            let exported_error = support_error(&imp.bodies[0].body);
+            eprintln!("length={length}, native_support_error={native_error:e}, exported_support_error={exported_error:e}");
+            assert!(exported_error < 2e-5, "STEP support error {exported_error} at length {length}");
+        }
+    }
+
     #[test]
     fn islands_are_solids_of_their_own_not_voids() {
         use solidcraft_geom::{Loop2, Plane, Region2, Vec2};

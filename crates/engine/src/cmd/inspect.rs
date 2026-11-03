@@ -11,7 +11,8 @@ use solidcraft_sketch::CurveKind;
 use super::CommandSpec;
 use crate::params::{bad, bool_, str_, string_list};
 use crate::schema::inspect::{
-    BodyListParams, FaceCylinder, ModelEdge, ModelEdges, ModelFace, ModelFaces, ModelThread, ModelThreads, ModelThreadsParams,
+    AnalyticBasis, AnalyticSurface, BodyListParams, EdgeCircleResult, FaceCylinder, ModelEdge, ModelEdges, ModelFace, ModelFaces, ModelThread,
+    ModelThreads, ModelThreadsParams,
 };
 use crate::schema::{TypedContract, output_schema_for};
 use crate::{EngineError, Result, Session};
@@ -56,6 +57,8 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params(
         "body: name → per face: index, name (what face.delete, sheet.convert `face`, solid.shell … take in place of a point), exact, area, centroid (not always on the face), \
          plane_normal, point (a point on the face that picks it), cylinder? ({origin, axis, radius} of a cylindrical face), \
+         analytic_surface? (native plane, cylinder, cone, sphere or torus in world coordinates), analytic_tolerance_mm? (source record tolerance), \
+         boundary_edges (native topology indices in model.edges, including seams), \
          sheet_face? (a folded sheet's face: `sheet:<body>:<panel>:<side>`, panel base or a flange's tag F<feature>.<k>, side top | bottom | rim.<edge> | bend.inner | bend.outer; \
          taken wherever a face name is, and it holds while sizes change and flanges come and go)",
     ),
@@ -437,6 +440,15 @@ fn model_edges(s: &mut Session, p: &Value) -> Result<Value> {
             length: e.length,
             start: e.points.first().map(|&p| p.into()),
             end: e.points.last().map(|&p| p.into()),
+            circle: solidcraft_kernel::edge_circle(&b.body, e.index).map(|c| EdgeCircleResult {
+                center: c.center.into(),
+                axis: solidcraft_geom::Vec3::from(c.axis).into(),
+                radius: c.radius,
+                start: c.start.into(),
+                end: c.end.into(),
+                angle_rad: c.angle,
+            }),
+            curve_tolerance_mm: solidcraft_kernel::edge_circle(&b.body, e.index).map(|_| (b.body.size() * 1e-7).max(1e-9) * 100.0),
         })
         .collect();
     reply("model.edges", ModelEdges { body: b.name.clone(), edges, param_warnings: Vec::new() })
@@ -452,6 +464,29 @@ fn model_faces(s: &mut Session, p: &Value) -> Result<Value> {
     let names = solidcraft_doc::naming::face_names(b);
     let tol = (b.body.size() * 2e-3).max(1e-3);
     let spots = solidcraft_doc::naming::face_spots(b);
+    let native = if b.body.is_mesh() { None } else { Some(solidcraft_kernel::brep_record(&b.body)?) };
+    let boundary_edges: Vec<Vec<usize>> = native
+        .as_ref()
+        .map(|record| {
+            record
+                .faces
+                .iter()
+                .map(|face| {
+                    let mut edges: Vec<usize> = face
+                        .loops
+                        .iter()
+                        .flat_map(|boundary| match boundary {
+                            solidcraft_geom::brep::Loop::Edges { edges } => edges.iter().map(|e| e.edge as usize).collect::<Vec<_>>(),
+                            _ => Vec::new(),
+                        })
+                        .collect();
+                    edges.sort_unstable();
+                    edges.dedup();
+                    edges
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     // A folded sheet's faces also have the readable names its sheet gives them, worked out in
     // the body's own coordinates.
     let model = s.model.state();
@@ -468,6 +503,15 @@ fn model_faces(s: &mut Session, p: &Value) -> Result<Value> {
                 }
                 _ => None,
             };
+            let native_support = spot.and_then(|x| x.surface);
+            let recognized = if native_support.is_none() {
+                native
+                    .as_ref()
+                    .and_then(|r| r.faces.get(f.index))
+                    .and_then(|face| solidcraft_geom::hlr::inspect::surface_support(face, 1e-9).ok().flatten())
+            } else {
+                None
+            };
             ModelFace {
                 index: f.index,
                 name: names.get(f.index).cloned(),
@@ -478,6 +522,56 @@ fn model_faces(s: &mut Session, p: &Value) -> Result<Value> {
                 point: spot.map(|x| x.point.into()),
                 cylinder,
                 sheet_face: sheet_names.get(f.index).and_then(|n| n.as_ref().map(|n| n.to_string())),
+                boundary_edges: boundary_edges.get(f.index).cloned().unwrap_or_default(),
+                analytic_surface: native_support
+                    .map(|surface| {
+                        use solidcraft_kernel::FaceSurface;
+                        match surface {
+                            FaceSurface::Plane { normal, point } => {
+                                AnalyticSurface::Plane { normal: solidcraft_geom::Vec3::from(normal).into(), point: point.into() }
+                            }
+                            FaceSurface::Cylinder { origin, axis, radius } => {
+                                AnalyticSurface::Cylinder { origin: origin.into(), axis: solidcraft_geom::Vec3::from(axis).into(), radius }
+                            }
+                            FaceSurface::Cone { apex, axis, half_angle } => AnalyticSurface::Cone {
+                                apex: apex.into(),
+                                axis: solidcraft_geom::Vec3::from(axis).into(),
+                                half_angle_rad: half_angle,
+                            },
+                            FaceSurface::Sphere { center, radius } => AnalyticSurface::Sphere { center: center.into(), radius },
+                            FaceSurface::Torus { center, axis, major, minor } => AnalyticSurface::Torus {
+                                center: center.into(),
+                                axis: solidcraft_geom::Vec3::from(axis).into(),
+                                major_radius: major,
+                                minor_radius: minor,
+                            },
+                        }
+                    })
+                    .or_else(|| {
+                        recognized.map(|surface| {
+                            use solidcraft_geom::hlr::inspect::SurfaceSupport;
+                            match surface {
+                                SurfaceSupport::Plane { normal, point } => AnalyticSurface::Plane { normal: normal.into(), point: point.into() },
+                                SurfaceSupport::Cylinder { origin, axis, radius } => {
+                                    AnalyticSurface::Cylinder { origin: origin.into(), axis: axis.into(), radius }
+                                }
+                                SurfaceSupport::Cone { apex, axis, half_angle } => {
+                                    AnalyticSurface::Cone { apex: apex.into(), axis: axis.into(), half_angle_rad: half_angle }
+                                }
+                                SurfaceSupport::Sphere { center, radius } => AnalyticSurface::Sphere { center: center.into(), radius },
+                                SurfaceSupport::Torus { center, axis, major_radius, minor_radius } => {
+                                    AnalyticSurface::Torus { center: center.into(), axis: axis.into(), major_radius, minor_radius }
+                                }
+                            }
+                        })
+                    }),
+                analytic_basis: if native_support.is_some() {
+                    Some(AnalyticBasis::NativeRecord)
+                } else {
+                    recognized.map(|_| AnalyticBasis::SurfaceRecognition)
+                },
+                analytic_tolerance_mm: (native_support.is_some() || recognized.is_some())
+                    .then(|| native.as_ref().map_or(0., |r| r.tolerance).max(b.body.size() * 1e-9)),
             }
         })
         .collect();

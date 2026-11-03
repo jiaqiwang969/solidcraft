@@ -51,7 +51,7 @@ pub struct BodyListParams {
 pub struct ModelThreadsParams {}
 
 /// What `model.edges` returns.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ModelEdges {
     /// The body's name.
     pub body: String,
@@ -63,7 +63,7 @@ pub struct ModelEdges {
 }
 
 /// One edge of a body.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ModelEdge {
     /// Its index, which changes when the body is rebuilt differently.
     pub index: usize,
@@ -78,10 +78,16 @@ pub struct ModelEdge {
     pub start: Option<[f64; 3]>,
     /// Where it ends; `null` for an edge with no points.
     pub end: Option<[f64; 3]>,
+    /// The kernel's circle or arc, when recognized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub circle: Option<EdgeCircleResult>,
+    /// Circle recognition tolerance (mm), not a manufacturing tolerance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub curve_tolerance_mm: Option<f64>,
 }
 
 /// What `model.faces` returns.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ModelFaces {
     /// The body's name.
     pub body: String,
@@ -93,7 +99,7 @@ pub struct ModelFaces {
 }
 
 /// One face of a body.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ModelFace {
     /// Its index, which changes when the body is rebuilt differently.
     pub index: usize,
@@ -120,10 +126,21 @@ pub struct ModelFace {
     /// flanges come and go.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sheet_face: Option<String>,
+    /// Native boundary edge indices, including seams, in model.edges order.
+    pub boundary_edges: Vec<usize>,
+    /// The kernel's analytic support in world coordinates, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analytic_surface: Option<AnalyticSurface>,
+    /// Whether the label was native or recognized from the surface's geometry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analytic_basis: Option<AnalyticBasis>,
+    /// The source record's tolerance (mm), not a certified fit or manufacturing tolerance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analytic_tolerance_mm: Option<f64>,
 }
 
 /// A cylindrical face's axis and radius.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FaceCylinder {
     /// A point on the axis.
     pub origin: [f64; 3],
@@ -243,3 +260,53 @@ impl From<&solidcraft_doc::ThreadInfo> for ModelThread {
 #[cfg(test)]
 #[path = "inspect_tests.rs"]
 mod tests;
+
+/// A support surface recognized by the existing kernel, expressed in world coordinates.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AnalyticSurface {
+    Plane {
+        normal: [f64; 3],
+        point: [f64; 3],
+    },
+    Cylinder {
+        origin: [f64; 3],
+        axis: [f64; 3],
+        radius: f64,
+    },
+    /// Axis points from the apex into the cone; half-angle is in radians.
+    Cone {
+        apex: [f64; 3],
+        axis: [f64; 3],
+        half_angle_rad: f64,
+    },
+    Sphere {
+        center: [f64; 3],
+        radius: f64,
+    },
+    /// The signed major radius also preserves the inner sheet of a spindle torus.
+    Torus {
+        center: [f64; 3],
+        axis: [f64; 3],
+        major_radius: f64,
+        minor_radius: f64,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct EdgeCircleResult {
+    pub center: [f64; 3],
+    pub axis: [f64; 3],
+    pub radius: f64,
+    pub start: [f64; 3],
+    pub end: [f64; 3],
+    /// Edge runs counter-clockwise about axis; radians, 2π for a whole circle.
+    pub angle_rad: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalyticBasis {
+    NativeRecord,
+    SurfaceRecognition,
+}
