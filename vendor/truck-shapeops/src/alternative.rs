@@ -180,3 +180,21 @@ where
         }
     }
 }
+
+// The vendored test fixtures also use the fallible sampling contract added by
+// the application mesher. Delegate it without changing production alternatives.
+#[cfg(test)]
+impl<C0: TrySubs, C1: TrySubs> TrySubs for Alternative<C0, C1> {
+    fn try_subs(&self, t: f64) -> Option<Point3> {
+        match self {
+            Self::FirstType(curve) => curve.try_subs(t),
+            Self::SecondType(curve) => curve.try_subs(t),
+        }
+    }
+    fn approx_subs(&self, t: f64) -> Point3 {
+        match self {
+            Self::FirstType(curve) => curve.approx_subs(t),
+            Self::SecondType(curve) => curve.approx_subs(t),
+        }
+    }
+}

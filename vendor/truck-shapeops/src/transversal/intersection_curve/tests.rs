@@ -156,7 +156,7 @@ fn collide_parabola() {
     println!("Meshing Surfaces: {}s", instant.elapsed().as_secs_f64());
     // extract intersection curves
     let instant = std::time::Instant::now();
-    let curves = intersection_curves(surface0, &polygon0, surface1, &polygon1, TOL);
+    let curves = intersection_curves(surface0, &polygon0, surface1, &polygon1, TOL, false);
     println!(
         "Extracting Intersection: {}s",
         instant.elapsed().as_secs_f64()

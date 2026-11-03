@@ -9,15 +9,19 @@ use crate::{KernelError, Result, guard};
 /// surfaces for every such edge.
 fn plain_curves(b: &Body) -> Result<mt::Solid> {
     let s = crate::ops::placed_topology(&b.solid, mt::Matrix4::from_scale(1.0))?;
-    let size = b.size();
     let mut seen = std::collections::HashSet::new();
     for e in s.edge_iter() {
         if !seen.insert(e.id()) {
             continue;
         }
-        if let mt::Curve::IntersectionCurve(ic) = e.curve()
-            && let Some(c) = hermite_through(&ic, size * 1e-4)
-        {
+        if let mt::Curve::IntersectionCurve(ic) = e.curve() {
+            // Export precision is in model millimetres, independent of a remote
+            // end of the body. Scaling this by body size loosened a small pocket's
+            // boundary by hundredths of a millimetre on otherwise exact supports.
+            let _ = mt::take_projection_failure();
+            let c = hermite_through(&ic, 1e-6);
+            let failed = mt::take_projection_failure();
+            let c = c.filter(|_| !failed).ok_or_else(|| KernelError::Failed("STEP intersection curve could not be fitted to its supports".into()))?;
             e.set_curve(mt::Curve::BSplineCurve(c));
         }
     }

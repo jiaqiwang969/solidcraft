@@ -69,14 +69,31 @@ impl EndPoint {
     }
 }
 
-fn tri_to_seg(tri: [Point3; 3], unit: Vector3) -> (f64, f64) {
+// A surface evaluation can place a boundary point one ULP away from the
+// incident face (for example 159.99999999999997 instead of 160). This bound
+// accounts for floating-point arithmetic only, not a modelling tolerance.
+fn scalar_roundoff(a: f64, b: f64) -> f64 {
+    8.0 * f64::EPSILON * a.abs().max(b.abs()).max(1.0)
+}
+
+fn tri_to_seg(tri: [Point3; 3], unit: Vector3, roundoff: bool) -> (f64, f64) {
     let a = tri[0].to_vec().dot(unit);
     let b = tri[1].to_vec().dot(unit);
     let c = tri[2].to_vec().dot(unit);
-    (f64::min(f64::min(a, b), c), f64::max(f64::max(a, b), c))
+    let scale = tri.iter().map(|p| p.x.abs()*unit.x.abs() + p.y.abs()*unit.y.abs() + p.z.abs()*unit.z.abs()).fold(1.0_f64, f64::max);
+    let pad = if roundoff { 8.0 * f64::EPSILON * scale } else { 0.0 };
+    (f64::min(f64::min(a, b), c) - pad, f64::max(f64::max(a, b), c) + pad)
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 fn sorted_endpoints<I, J>(iter0: I, iter1: J, unit: Vector3) -> Vec<EndPoint>
+where
+    I: IntoIterator<Item = [Point3; 3]>,
+    J: IntoIterator<Item = [Point3; 3]>, {
+    sorted_endpoints_mode(iter0, iter1, unit, false)
+}
+
+fn sorted_endpoints_mode<I, J>(iter0: I, iter1: J, unit: Vector3, roundoff: bool) -> Vec<EndPoint>
 where
     I: IntoIterator<Item = [Point3; 3]>,
     J: IntoIterator<Item = [Point3; 3]>, {
@@ -84,20 +101,20 @@ where
         .into_iter()
         .enumerate()
         .filter(|(_, tri)| !(tri[1] - tri[0]).cross(tri[2] - tri[0]).so_small())
-        .flat_map(|(i, tri)| EndPoint::from_seg(tri_to_seg(tri, unit), 0, i))
+        .flat_map(|(i, tri)| EndPoint::from_seg(tri_to_seg(tri, unit, roundoff), 0, i))
         .chain(
             iter1
                 .into_iter()
                 .enumerate()
                 .filter(|(_, tri)| !(tri[1] - tri[0]).cross(tri[2] - tri[0]).so_small())
-                .flat_map(|(i, tri)| EndPoint::from_seg(tri_to_seg(tri, unit), 1, i)),
+                .flat_map(|(i, tri)| EndPoint::from_seg(tri_to_seg(tri, unit, roundoff), 1, i)),
         )
         .collect();
     res.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
     res
 }
 
-fn collide_seg_triangle(seg: [Point3; 2], tri: [Point3; 3]) -> Option<Point3> {
+fn collide_seg_triangle(seg: [Point3; 2], tri: [Point3; 3], roundoff: bool) -> Option<Point3> {
     let ab = tri[1] - tri[0];
     let bc = tri[2] - tri[1];
     let ca = tri[0] - tri[2];
@@ -107,17 +124,41 @@ fn collide_seg_triangle(seg: [Point3; 2], tri: [Point3; 3]) -> Option<Point3> {
     }
     let ap = seg[0] - tri[0];
     let aq = seg[1] - tri[0];
-    let dotapnor = ap.dot(nor);
-    let dotaqnor = aq.dot(nor);
-    if dotapnor * dotaqnor > 0.0 {
+    if !roundoff {
+        let dotapnor = ap.dot(nor);
+        let dotaqnor = aq.dot(nor);
+        if dotapnor * dotaqnor > 0.0 { return None; }
+        let h = seg[0] + dotapnor / (dotapnor - dotaqnor) * (seg[1] - seg[0]);
+        return (f64::signum(ab.cross(nor).dot(h - tri[0]) + TOLERANCE2)
+            + f64::signum(bc.cross(nor).dot(h - tri[1]) + TOLERANCE2)
+            + f64::signum(ca.cross(nor).dot(h - tri[2]) + TOLERANCE2) >= 2.0).then_some(h);
+    }
+    let scale = tri.iter().chain(seg.iter()).map(|p| p.x.abs().max(p.y.abs()).max(p.z.abs())).fold(1.0_f64, f64::max);
+    let bound = 8.0 * f64::EPSILON * scale * (nor.x.abs() + nor.y.abs() + nor.z.abs());
+    let (a, b) = (ap.dot(nor), aq.dot(nor));
+    if ![a, b, bound].iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let dotapnor = if a.abs() <= bound { 0.0 } else { a };
+    let dotaqnor = if b.abs() <= bound { 0.0 } else { b };
+    // Coplanar segments do not define a transverse intersection. Keeping the
+    // zero denominator out also prevents NaN points on coincident faces.
+    if (dotapnor == 0.0 && dotaqnor == 0.0)
+        || (dotapnor > 0.0 && dotaqnor > 0.0)
+        || (dotapnor < 0.0 && dotaqnor < 0.0)
+    {
         return None;
     }
     let h = seg[0] + dotapnor / (dotapnor - dotaqnor) * (seg[1] - seg[0]);
-    if f64::signum(ab.cross(nor).dot(h - tri[0]) + TOLERANCE2)
-        + f64::signum(bc.cross(nor).dot(h - tri[1]) + TOLERANCE2)
-        + f64::signum(ca.cross(nor).dot(h - tri[2]) + TOLERANCE2)
-        >= 2.0
-    {
+    let inside_edge = |edge: Vector3, origin: Point3| {
+        let side = edge.cross(nor);
+        let value = side.dot(h - origin);
+        // This signed half-space expression scales with the edge and normal;
+        // a fixed epsilon alone loses contacts on long, thin tool walls.
+        let rounding = 8.0 * f64::EPSILON * scale * (side.x.abs() + side.y.abs() + side.z.abs());
+        value.is_finite() && rounding.is_finite() && value >= -(TOLERANCE2 + rounding)
+    };
+    if inside_edge(ab, tri[0]) && inside_edge(bc, tri[1]) && inside_edge(ca, tri[2]) {
         Some(h)
     } else {
         None
@@ -125,14 +166,18 @@ fn collide_seg_triangle(seg: [Point3; 2], tri: [Point3; 3]) -> Option<Point3> {
 }
 
 fn collide_triangles(tri0: [Point3; 3], tri1: [Point3; 3]) -> Option<(Point3, Point3)> {
+    collide_triangles_mode(tri0, tri1, false)
+}
+
+fn collide_triangles_mode(tri0: [Point3; 3], tri1: [Point3; 3], roundoff: bool) -> Option<(Point3, Point3)> {
     let mut tuple = (None, None);
     [
-        collide_seg_triangle([tri0[0], tri0[1]], tri1),
-        collide_seg_triangle([tri0[1], tri0[2]], tri1),
-        collide_seg_triangle([tri0[2], tri0[0]], tri1),
-        collide_seg_triangle([tri1[0], tri1[1]], tri0),
-        collide_seg_triangle([tri1[1], tri1[2]], tri0),
-        collide_seg_triangle([tri1[2], tri1[0]], tri0),
+        collide_seg_triangle([tri0[0], tri0[1]], tri1, roundoff),
+        collide_seg_triangle([tri0[1], tri0[2]], tri1, roundoff),
+        collide_seg_triangle([tri0[2], tri0[0]], tri1, roundoff),
+        collide_seg_triangle([tri1[0], tri1[1]], tri0, roundoff),
+        collide_seg_triangle([tri1[1], tri1[2]], tri0, roundoff),
+        collide_seg_triangle([tri1[2], tri1[0]], tri0, roundoff),
     ]
     .into_iter()
     .for_each(|pt| match tuple {
@@ -174,13 +219,21 @@ fn boxed_triangles(poly: &PolygonMesh) -> Vec<([Point3; 3], BoundingBox<Point3>)
 
 /// Whether two triangles' bounding boxes miss each other (touching boxes do not miss).
 #[inline(always)]
+#[cfg(any(test, feature = "test-hooks"))]
 fn disjoint_boxes(bdb0: &BoundingBox<Point3>, bdb1: &BoundingBox<Point3>) -> bool {
-    bdb0.max()[0] < bdb1.min()[0]
-        || bdb1.max()[0] < bdb0.min()[0]
-        || bdb0.max()[1] < bdb1.min()[1]
-        || bdb1.max()[1] < bdb0.min()[1]
-        || bdb0.max()[2] < bdb1.min()[2]
-        || bdb1.max()[2] < bdb0.min()[2]
+    disjoint_boxes_mode(bdb0, bdb1, false)
+}
+
+fn disjoint_boxes_mode(bdb0: &BoundingBox<Point3>, bdb1: &BoundingBox<Point3>, roundoff: bool) -> bool {
+    if !roundoff {
+        return bdb0.max()[0] < bdb1.min()[0] || bdb1.max()[0] < bdb0.min()[0]
+            || bdb0.max()[1] < bdb1.min()[1] || bdb1.max()[1] < bdb0.min()[1]
+            || bdb0.max()[2] < bdb1.min()[2] || bdb1.max()[2] < bdb0.min()[2];
+    }
+    (0..3).any(|i| {
+        bdb1.min()[i] - bdb0.max()[i] > scalar_roundoff(bdb1.min()[i], bdb0.max()[i])
+            || bdb0.min()[i] - bdb1.max()[i] > scalar_roundoff(bdb0.min()[i], bdb1.max()[i])
+    })
 }
 
 /// Pairs of triangles (one from each mesh) whose bounding boxes overlap, in the order the
@@ -195,10 +248,20 @@ fn candidate_pairs(
     tris1: &[([Point3; 3], BoundingBox<Point3>)],
     unit: Vector3,
 ) -> Vec<(usize, usize)> {
-    let endpoints = sorted_endpoints(
+    candidate_pairs_mode(tris0, tris1, unit, false)
+}
+
+fn candidate_pairs_mode(
+    tris0: &[([Point3; 3], BoundingBox<Point3>)],
+    tris1: &[([Point3; 3], BoundingBox<Point3>)],
+    unit: Vector3,
+    roundoff: bool,
+) -> Vec<(usize, usize)> {
+    let endpoints = sorted_endpoints_mode(
         tris0.iter().map(|(t, _)| *t),
         tris1.iter().map(|(t, _)| *t),
         unit,
+        roundoff,
     );
     let boxes = [tris0, tris1];
     let mut open = [Vec::<usize>::new(), Vec::<usize>::new()];
@@ -214,7 +277,7 @@ fn candidate_pairs(
             EndPointType::Front => {
                 let mine = &boxes[segnum][index].1;
                 for &other in &open[1 - segnum] {
-                    if !disjoint_boxes(mine, &boxes[1 - segnum][other].1) {
+                    if !disjoint_boxes_mode(mine, &boxes[1 - segnum][other].1, roundoff) {
                         pairs.push(if segnum == 0 {
                             (index, other)
                         } else {
@@ -237,13 +300,24 @@ fn candidate_pairs(
 }
 
 fn collision(poly0: &PolygonMesh, poly1: &PolygonMesh) -> Vec<(Point3, Point3)> {
+    collision_mode(poly0, poly1, false)
+}
+
+/// Re-evaluate a failed solid construction with arithmetic roundoff accounted
+/// for in contact predicates. Coordinates, surfaces and model tolerances stay
+/// unchanged. The ordinary collision query retains its previous behaviour.
+pub fn extract_roundoff_interference(poly0: &PolygonMesh, poly1: &PolygonMesh) -> Vec<(Point3, Point3)> {
+    collision_mode(poly0, poly1, true)
+}
+
+fn collision_mode(poly0: &PolygonMesh, poly1: &PolygonMesh, roundoff: bool) -> Vec<(Point3, Point3)> {
     let unit = match poly0.positions().is_empty() {
         true => return Vec::new(),
         false => hash::take_one_unit(poly0.positions()[0]),
     };
     let (tris0, tris1) = (boxed_triangles(poly0), boxed_triangles(poly1));
-    let pairs = candidate_pairs(&tris0, &tris1, unit);
-    let test = |&(i, j): &(usize, usize)| collide_triangles(tris0[i].0, tris1[j].0);
+    let pairs = candidate_pairs_mode(&tris0, &tris1, unit, roundoff);
+    let test = |&(i, j): &(usize, usize)| collide_triangles_mode(tris0[i].0, tris1[j].0, roundoff);
     #[cfg(not(target_arch = "wasm32"))]
     {
         use rayon::prelude::*;
@@ -300,6 +374,66 @@ fn collide_triangles_test() {
         Point3::new(1.0, 1.0, 1.0),
     ];
     assert!(collide_triangles(tri0, tri1).is_none());
+}
+
+#[test]
+fn boundary_contact_survives_one_ulp_of_mesh_roundoff() {
+    for x in [1.0_f64, 64.0, 160.0, 4096.0] {
+        let face = [Point3::new(x, -2., -2.), Point3::new(x, 2., -2.), Point3::new(x, 0., 2.)];
+        let wall = [Point3::new(x.next_down(), -0.5, 0.), Point3::new(x.next_down(), 0.5, 0.), Point3::new(x-4., 0., 0.)];
+        for (a, b) in [(face, wall), (wall, face)] {
+            let ba = vec![(a, a.iter().collect())];
+            let bb = vec![(b, b.iter().collect())];
+            for direction in [Vector3::unit_x(), Vector3::new(1., 2., 3.).normalize()] {
+                assert_eq!(candidate_pairs_mode(&ba, &bb, direction, true), vec![(0, 0)], "candidate x={x}");
+            }
+            let (p, q) = collide_triangles_mode(a, b, true).expect("transverse contact line survives roundoff");
+            assert!((p.x-x).abs() <= 2e-12 && (q.x-x).abs() <= 2e-12, "x={x}: {p:?} {q:?}");
+            assert!(p.z.abs() < 1e-12 && q.z.abs() < 1e-12);
+            assert!((p.distance(q)-1.).abs() < 1e-12, "x={x}: {p:?} {q:?}");
+        }
+    }
+}
+
+#[test]
+fn roundoff_contact_keeps_real_gaps_and_coplanar_faces_separate() {
+    for x in [1.0_f64, 64.0, 160.0, 4096.0] {
+        let face = [Point3::new(x, -2., -2.), Point3::new(x, 2., -2.), Point3::new(x, 0., 2.)];
+        for gap in [1e-9, 1e-7, 1e-4] {
+            let wall = [Point3::new(x-gap, -0.5, 0.), Point3::new(x-gap, 0.5, 0.), Point3::new(x-4., 0., 0.)];
+            let ba = vec![(face, face.iter().collect())];
+            let bb = vec![(wall, wall.iter().collect())];
+            assert!(candidate_pairs(&ba, &bb, Vector3::unit_x()).is_empty());
+            assert!(collide_triangles(face, wall).is_none());
+            assert!(candidate_pairs_mode(&ba, &bb, Vector3::unit_x(), true).is_empty());
+            assert!(collide_triangles_mode(face, wall, true).is_none());
+        }
+        assert!(collide_triangles(face, face).is_none());
+        assert!(collide_triangles_mode(face, face, true).is_none());
+    }
+}
+
+#[test]
+fn long_wall_contact_keeps_the_clipped_intersection_interval() {
+    for x in [1.0_f64, 64.0, 160.0, 4096.0] {
+        let face = [Point3::new(x, -2., -2.), Point3::new(x, 2., -2.), Point3::new(x, 0., 2.)];
+        // Both ends of the wall's contact edge lie outside the face: the
+        // interval must come from clipping the face's own edges against it.
+        let wall = [Point3::new(x.next_down(), -40., 0.), Point3::new(x.next_down(), 40., 0.), Point3::new(x-160., 0., 0.)];
+        for (a, b) in [(face, wall), (wall, face)] {
+            let (p, q) = collide_triangles_mode(a, b, true).expect("roundoff must not remove a clipped contact line");
+            assert!((p.x-x).abs() <= 2e-12 && (q.x-x).abs() <= 2e-12, "x={x}: {p:?} {q:?}");
+            assert!(p.z.abs() < 1e-12 && q.z.abs() < 1e-12);
+            assert!((p.distance(q)-2.).abs() < 1e-12, "x={x}: {p:?} {q:?}");
+        }
+        for gap in [1e-9, 1e-7] {
+            let separated = [Point3::new(x-gap, -40., 0.), Point3::new(x-gap, 40., 0.), Point3::new(x-160., 0., 0.)];
+            for roundoff in [false, true] {
+                assert!(collide_triangles_mode(face, separated, roundoff).is_none(), "real gap {gap} at x={x}");
+                assert!(collide_triangles_mode(separated, face, roundoff).is_none(), "reversed real gap {gap} at x={x}");
+            }
+        }
+    }
 }
 
 /// The candidate search before boxes were computed once and the open list stopped being

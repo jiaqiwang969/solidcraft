@@ -6,6 +6,27 @@ use self::topology::PreStepModel;
 
 const ERR: Result = Err(std::fmt::Error);
 
+/// STEP knot values and multiplicities without merging distinct parameters.
+///
+/// SolidCraft: geometric proximity is not knot equality. Combining nearby
+/// cubic knots can create internal multiplicities of six or nine and make
+/// otherwise valid geometry impossible for another STEP reader to construct.
+pub fn exact_knot_multiplicities(values: &[f64]) -> (Vec<f64>, Vec<usize>) {
+    let mut knots = Vec::new();
+    let mut multiplicities = Vec::new();
+    for &value in values {
+        if knots.last() == Some(&value) {
+            if let Some(count) = multiplicities.last_mut() {
+                *count += 1;
+            }
+        } else {
+            knots.push(value);
+            multiplicities.push(1);
+        }
+    }
+    (knots, multiplicities)
+}
+
 #[cfg(feature = "derive")]
 pub use truck_derivers::{DisplayByStep, StepLength};
 

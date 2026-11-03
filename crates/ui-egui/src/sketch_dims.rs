@@ -72,7 +72,7 @@ fn eval(doc: &Document, text: &str, kind: ValueKind) -> solidcraft_engine::doc::
 /// Whether a box becomes one of the shape's dimensions. A rounded rectangle's radius is its own
 /// parameter (sent with the shape); sides and rho are counts and shape factors.
 fn is_dimension(t: &Tool, label: &str) -> bool {
-    !matches!(label, "Sides" | "Rho") && !(t.cmd == "sketch.rectangle.rounded" && label == "Radius")
+    !(matches!(label, "Sides" | "Rho") || t.cmd == "sketch.rectangle.rounded" && label == "Radius")
 }
 
 fn dir_or_x(v: Vec2) -> Vec2 {

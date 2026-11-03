@@ -267,7 +267,8 @@ impl Out {
             .collect::<Vec<_>>()
             .join(",");
         let list = |v: Vec<String>| v.join(",");
-        let ((ku, mu), (kv, mv)) = (ku.to_single_multi(), kv.to_single_multi());
+        let ((ku, mu), (kv, mv)) =
+            (truck_stepio::out::exact_knot_multiplicities(ku.as_slice()), truck_stepio::out::exact_knot_multiplicities(kv.as_slice()));
         let knots = format!(
             "({}),({}),({}),({}),.UNSPECIFIED.",
             list(mu.iter().map(|m| m.to_string()).collect()),
@@ -1846,6 +1847,70 @@ pub fn step_export_bodies(bodies: &[ExportBody], header: &StepHeader) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn step_preserves_close_distinct_spline_knots() {
+        use truck_modeling::{BSplineCurve, KnotVec, Point3};
+        let knots = KnotVec::from(vec![0., 0., 0., 0., 0.5, 0.5, 0.5, 0.5000002, 0.5000002, 0.5000002, 1., 1., 1., 1.]);
+        let poles = (0..10).map(|i| Point3::new(i as f64, 0., 0.)).collect();
+        let curve = BSplineCurve::try_new(knots, poles).unwrap();
+        let display = truck_stepio::out::StepDisplay::new(&curve, 1);
+        let text = truck_stepio::out::CompleteStepDisplay::new(display, Default::default()).to_string();
+        let exchange = p21::parse(&text).unwrap();
+        let params = exchange.get(1).unwrap().params();
+        let multiplicities: Vec<_> = params[6].as_list().unwrap().iter().map(|p| p.as_f64().unwrap() as usize).collect();
+        let written_knots: Vec<_> = params[7].as_list().unwrap().iter().map(|p| p.as_f64().unwrap()).collect();
+        assert_eq!(multiplicities, vec![4, 3, 3, 4]);
+        assert_eq!(written_knots, vec![0., 0.5, 0.5000002, 1.]);
+        assert_eq!(multiplicities.iter().sum::<usize>(), curve.control_points().len() + curve.degree() + 1);
+    }
+
+    /// A transverse circular pocket has an intersection that is on both analytic
+    /// cylinders. Whole-body size must not turn STEP export into a loose fit of it.
+    #[test]
+    fn cross_drilled_cylinder_step_keeps_intersection_on_both_cylinders() {
+        use truck_modeling::{BoundedCurve, ParametricCurve};
+        let support_error = |body: &Body| {
+            let mut count = 0;
+            let mut worst = 0.0_f64;
+            for edge in body.solid.edge_iter() {
+                let curve = edge.curve();
+                // The pocket wall's vertical seam is on only the tool cylinder;
+                // it is not an edge at which the two cylinders intersect.
+                if matches!(curve, truck_modeling::Curve::Line(_)) {
+                    continue;
+                }
+                let (lo, hi) = curve.range_tuple();
+                for k in 1..100 {
+                    let t = lo + (hi - lo) * k as f64 / 100.0;
+                    let p = match &curve {
+                        truck_modeling::Curve::IntersectionCurve(c) => c.search_triple(t).unwrap().0,
+                        _ => curve.subs(t),
+                    };
+                    if (13.9..22.1).contains(&p.x) && p.y.abs() < 4.1 && (9.0..12.1).contains(&p.z) {
+                        count += 1;
+                        worst = worst.max((p.y.hypot(p.z) - 12.0).abs()).max(((p.x - 18.0).hypot(p.y) - 4.0).abs());
+                    }
+                }
+            }
+            assert!(count > 100, "must sample the curved intersection");
+            worst
+        };
+        for length in [80.0, 240.0] {
+            let shaft = crate::cylinder(Vec3::ZERO, Vec3::X, 12.0, length).unwrap();
+            let tool = crate::cylinder(Vec3::new(18.0, 0.0, 8.0), Vec3::Z, 4.0, 20.0).unwrap();
+            let body = crate::boolean(&shaft, &tool, crate::BoolOp::Cut).unwrap().unwrap();
+            let native_error = support_error(&body);
+            assert!(native_error < 2e-5, "native support error {native_error} at length {length}");
+            let text = crate::step_export(&[&body], "analytic intersection regression").unwrap();
+            let imp = crate::step_import(&text).unwrap();
+            assert_eq!(imp.bodies.len(), 1);
+            assert!(imp.bodies[0].closed);
+            let exported_error = support_error(&imp.bodies[0].body);
+            eprintln!("length={length}, native_support_error={native_error:e}, exported_support_error={exported_error:e}");
+            assert!(exported_error < 2e-5, "STEP support error {exported_error} at length {length}");
+        }
+    }
 
     #[test]
     fn islands_are_solids_of_their_own_not_voids() {

@@ -81,3 +81,33 @@ fn unrecovered_empty_attempts_keep_refusal_without_displacing_tool() {
     let error = result.unwrap_err();
     assert!(error.to_string().contains("it came out empty"), "{error}");
 }
+
+/// A small spherical bite in a large ball needs the fine numerical route when
+/// coarse tracing fails. That route must be tried before displacing the cutter.
+#[test]
+fn failed_coarse_cut_refines_before_displacing_the_tool() {
+    let target = sphere(Vec3::ZERO, 30.0).unwrap();
+    let tool = sphere(Vec3::new(30.0, 0.0, 0.0), 2.0).unwrap();
+    let fine_attempts = Cell::new(0);
+    let intersect = |a: &Body, b: &Body, op: BoolOp, shift: Option<mt::Vector3>, tol: f64| {
+        if tol >= 0.01 {
+            return Err(KernelError::Failed("injected coarse tracing failure".into()));
+        }
+        fine_attempts.set(fine_attempts.get() + 1);
+        truck_boolean(a, b, op, shift, tol)
+    };
+    let (result, diagnostics) =
+        capture_boolean_diagnostics(|| boolean_via(&target, &tool, BoolOp::Cut, &|a, b, op| boolean_whole_with(a, b, op, false, &intersect)));
+    let cut = result.unwrap().unwrap();
+    assert!(fine_attempts.get() > 0, "the unchanged operands must get a fine attempt before a nudge can win");
+    assert!(diagnostics.warning().is_none(), "{diagnostics:?}");
+    assert!(diagnostics.events.iter().any(|event| event.strategy == BooleanStrategy::RefinedTolerance), "{diagnostics:?}");
+    assert!(cut.validity().is_empty(), "{:?}", cut.validity());
+    assert_eq!(cut.shell_count(), 1);
+    assert!(cut.history().is_some());
+    // Sphere/sphere lens: pi*(R+r-d)^2*(d^2+2d(R+r)-3(R-r)^2)/(12d).
+    let removed = PI * 4.0 * (900.0 + 60.0 * 32.0 - 3.0 * 28.0 * 28.0) / 360.0;
+    let expected = 4.0 * PI * 30.0_f64.powi(3) / 3.0 - removed;
+    let actual = cut.tessellate_with(0.0005, true).unwrap().measure().volume;
+    assert!((actual - expected).abs() < expected * 1e-4, "{actual} vs {expected}");
+}

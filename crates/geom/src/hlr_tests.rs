@@ -45,6 +45,208 @@ fn never() -> bool {
 }
 
 #[test]
+fn edge_visibility_diagnostics_match_analytic_box_depth_and_preserve_world_coordinates() {
+    let opts = Options::default();
+    let view = View::new(Vec3::new(-1., -2., -3.), Vec3::Z).unwrap();
+    for shift in [0., 1e6] {
+        let lo = [2. + shift, 3. + shift, 5. + shift];
+        let hi = [9. + shift, 14. + shift, 18. + shift];
+        let body = cuboid(lo, hi);
+        let prepared = prepare(&body, &opts).unwrap();
+        for edge in 0..12 {
+            let probe = inspect::edge_visibility(&prepared, edge, 0.5, &view, &opts, &never).unwrap();
+            let expected = if [0, 4, 8].contains(&edge) { Visibility::Hidden } else { Visibility::Visible };
+            assert_eq!(probe.point.classification, expected, "edge {edge} shift {shift}: {probe:?}");
+            assert!(probe.point.hit_reduction_matches);
+            let Curve::Line { start, end } = &body.shells[0].edges[edge].curve else { panic!("box edge is a line") };
+            let midpoint = (curve::v3(*start) + curve::v3(*end)) * 0.5;
+            assert!(probe.point.source_point.dist(midpoint) < 1e-9);
+            for hit in &probe.point.hits {
+                assert!(hit.ray_residual_mm < 1e-7);
+                if hit.effect == "occludes" {
+                    assert!(hit.ray_parameter > 0. && hit.inside_trim == Some(true) && !hit.near_boundary);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn edge_visibility_diagnostics_refuse_invalid_parameters_and_observe_cancellation() {
+    let opts = Options::default();
+    let prepared = prepare(&cuboid([0.; 3], [1.; 3]), &opts).unwrap();
+    let view = View::new(-Vec3::Z, Vec3::Y).unwrap();
+    for t in [-1., 2., f64::NAN, f64::INFINITY] {
+        assert!(matches!(inspect::edge_visibility(&prepared, 0, t, &view, &opts, &never), Err(HlrError::Invalid(_))));
+    }
+    assert!(matches!(inspect::edge_visibility(&prepared, usize::MAX, 0.5, &view, &opts, &never), Err(HlrError::Invalid(_))));
+    assert!(matches!(inspect::edge_visibility(&prepared, 0, 0.5, &view, &opts, &|| true), Err(HlrError::Cancelled)));
+}
+
+#[test]
+fn silhouette_diagnostics_share_drawn_tracks_and_resolve_both_sphere_hemispheres() {
+    let opts = Options::default();
+    let view = View::new(Vec3::X, Vec3::Z).unwrap();
+    for (body, is_sphere) in [(cylinder(10., 30.), false), (sphere(10.), true)] {
+        let def = prepare(&body, &opts).unwrap();
+        let drawing = hidden_lines(std::slice::from_ref(&def), &[identity(0, [0.; 3])], &view, &opts, &never).unwrap();
+        let mut requests = Vec::new();
+        for (track, line) in drawing.lines.iter().enumerate() {
+            let Source::Silhouette { face } = line.source else { continue };
+            for piece in &line.pieces {
+                for fraction in [0.137, 0.371, 0.633, 0.863] {
+                    requests.push(inspect::SilhouetteParameter { track, face, parameter: piece.t[0] + fraction * (piece.t[1] - piece.t[0]) });
+                }
+            }
+        }
+        assert!(!requests.is_empty());
+        let probes = inspect::silhouette_visibility(&def, &requests, &view, &opts, &never).unwrap();
+        let mut active = std::collections::BTreeSet::new();
+        for (request, probe) in requests.iter().zip(&probes) {
+            assert_eq!(probe.track, request.track);
+            assert_eq!(probe.source, drawing.lines[request.track].source);
+            assert_eq!(probe.point.classification, Visibility::Visible);
+            assert!(probe.point.hit_reduction_matches);
+            let p = probe.point.source_point;
+            assert!(p.x.abs() < 1e-8, "silhouette is in the X=0 plane: {p:?}");
+            if is_sphere {
+                assert!((p.len() - 10.).abs() < 1e-8);
+            } else {
+                assert!((p.y.abs() - 10.).abs() < 1e-8 && p.z > 0. && p.z < 30.);
+            }
+            assert_eq!(probe.point.screen, view.screen(p));
+            let supports: Vec<_> = probe
+                .support_observations
+                .iter()
+                .filter(|s| s.inverse_residual_mm.is_some_and(|r| r < 1e-7) && (s.inside_trim == Some(true) || s.near_boundary == Some(true)))
+                .collect();
+            assert!(!supports.is_empty(), "missing actual support: {probe:?}");
+            for support in supports {
+                assert!(support.normal_dot_sight.is_some_and(|n| n.abs() < 1e-8));
+                active.insert(support.face);
+            }
+        }
+        if is_sphere {
+            assert_eq!(active, [0, 1].into_iter().collect());
+            assert!(probes.iter().all(|p| p.source == Source::Silhouette { face: 0 }));
+        }
+    }
+}
+
+#[test]
+fn silhouette_diagnostics_distinguish_a_real_front_occluder() {
+    let mut body = cylinder(10., 30.);
+    body.shells.extend(cuboid([-5., 5., 5.], [-2., 15., 25.]).shells);
+    let opts = Options::default();
+    let view = View::new(Vec3::X, Vec3::Z).unwrap();
+    let def = prepare(&body, &opts).unwrap();
+    let drawing = hidden_lines(std::slice::from_ref(&def), &[identity(0, [0.; 3])], &view, &opts, &never).unwrap();
+    let requests: Vec<_> = drawing
+        .lines
+        .iter()
+        .enumerate()
+        .flat_map(|(track, line)| {
+            let face = match line.source {
+                Source::Silhouette { face } => Some(face),
+                _ => None,
+            };
+            line.pieces.iter().filter_map(move |p| face.map(|face| inspect::SilhouetteParameter { track, face, parameter: (p.t[0] + p.t[1]) * 0.5 }))
+        })
+        .collect();
+    let probes = inspect::silhouette_visibility(&def, &requests, &view, &opts, &never).unwrap();
+    let mut hidden = 0;
+    let mut visible = 0;
+    for p in probes {
+        let q = p.point.source_point;
+        let expected = if q.y > 0. && q.z > 5. && q.z < 25. {
+            hidden += 1;
+            Visibility::Hidden
+        } else {
+            visible += 1;
+            Visibility::Visible
+        };
+        assert_eq!(p.point.classification, expected, "{p:?}");
+        assert!(p.point.hit_reduction_matches);
+    }
+    assert!(hidden > 0 && visible > 0);
+}
+
+#[test]
+fn silhouette_diagnostics_reject_wrong_sources_parameters_limits_and_cancellation() {
+    let opts = Options::default();
+    let view = View::new(Vec3::X, Vec3::Z).unwrap();
+    let def = prepare(&cylinder(10., 30.), &opts).unwrap();
+    let drawing = hidden_lines(std::slice::from_ref(&def), &[identity(0, [0.; 3])], &view, &opts, &never).unwrap();
+    let (track, line) = drawing.lines.iter().enumerate().find(|(_, l)| matches!(l.source, Source::Silhouette { .. })).unwrap();
+    let Source::Silhouette { face } = line.source else { panic!("expected the selected silhouette") };
+    let request = inspect::SilhouetteParameter { track, face, parameter: (line.pieces[0].t[0] + line.pieces[0].t[1]) * 0.5 };
+    for bad in [
+        inspect::SilhouetteParameter { track: usize::MAX, ..request },
+        inspect::SilhouetteParameter { face: usize::MAX, ..request },
+        inspect::SilhouetteParameter { track: 0, ..request },
+        inspect::SilhouetteParameter { parameter: f64::NAN, ..request },
+        inspect::SilhouetteParameter { parameter: f64::INFINITY, ..request },
+        inspect::SilhouetteParameter { parameter: -1., ..request },
+        inspect::SilhouetteParameter { parameter: 2., ..request },
+    ] {
+        assert!(matches!(inspect::silhouette_visibility(&def, &[bad], &view, &opts, &never), Err(HlrError::Invalid(_))));
+    }
+    assert!(matches!(inspect::silhouette_visibility(&def, &[request], &view, &opts, &|| true), Err(HlrError::Cancelled)));
+    assert!(matches!(inspect::silhouette_visibility(&def, &vec![request; 513], &view, &opts, &never), Err(HlrError::Budget(_))));
+    assert!(matches!(inspect::silhouette_visibility(&def, &[request], &view, &Options { max_tracks: 0, ..opts }, &never), Err(HlrError::Budget(_))));
+}
+
+#[test]
+fn adapted_edge_accuracy_survives_projection_and_invalid_declarations_are_refused() {
+    use crate::section::CurveAccuracy;
+    let body = cuboid([0.; 3], [1.; 3]);
+    let opts = Options::default();
+    assert!(matches!(prepare_with_accuracy(&body, Some(&[]), &opts, &never), Err(HlrError::Invalid(_))));
+    let mut accuracy = vec![CurveAccuracy::Analytic; 12];
+    for bad in [f64::NAN, -1., f64::INFINITY] {
+        accuracy[0] = CurveAccuracy::Sampled { max_sample_deviation_mm: bad };
+        assert!(matches!(prepare_with_accuracy(&body, Some(&accuracy), &opts, &never), Err(HlrError::Invalid(_))));
+    }
+    accuracy[0] = CurveAccuracy::Sampled { max_sample_deviation_mm: 0.001 };
+    let prepared = prepare_with_accuracy(&body, Some(&accuracy), &opts, &never).unwrap();
+    let view = View::new(Vec3::new(-1., -1., -1.), Vec3::Z).unwrap();
+    let drawing = hidden_lines(&[prepared], &[identity(0, [0.; 3])], &view, &opts, &never).unwrap();
+    let line = drawing.lines.iter().find(|l| matches!(l.source, Source::Edge { edge: 0, .. })).unwrap();
+    assert_eq!(line.support_faces, vec![0, 2]);
+    assert!(!line.pieces.is_empty());
+    for p in &line.pieces {
+        assert!(matches!(p.accuracy, CurveAccuracy::Sampled { max_sample_deviation_mm: d } if d >= 0.001), "source deviation lost: {:?}", p.accuracy);
+    }
+}
+
+#[test]
+fn source_accuracy_near_a_torus_contact_remains_uncertain_without_hiding_clear_states() {
+    let opts = Options { trim_samples: 1024, ..Options::default() };
+    let view = View::new(-Vec3::Z, Vec3::Y).unwrap();
+    for (rho, front_box, want) in [
+        (25. + 0.5e-6, false, Visibility::Uncertain),
+        (25. - 0.5e-6, false, Visibility::Uncertain),
+        (25.01, false, Visibility::Visible),
+        (24.99, false, Visibility::Hidden),
+        (25. + 0.5e-6, true, Visibility::Hidden),
+    ] {
+        let mut body = cuboid([rho - 0.01, 0., -11.], [rho + 0.01, 0.02, -10.]);
+        body.shells.extend(torus(20., 5.).shells);
+        if front_box {
+            body.shells.extend(cuboid([20., -1., 5.], [30., 1., 6.]).shells);
+        }
+        let count = body.shells.iter().map(|s| s.edges.len()).sum();
+        let mut accuracy = vec![CurveAccuracy::Analytic; count];
+        accuracy[2] = CurveAccuracy::Sampled { max_sample_deviation_mm: 1e-6 };
+        let prepared = prepare_with_accuracy(&body, Some(&accuracy), &opts, &never).unwrap();
+        let probe = inspect::edge_visibility(&prepared, 2, 0.5, &view, &opts, &never).unwrap();
+        assert_eq!(probe.point.classification, want, "rho {rho}, front box {front_box}: {probe:?}");
+        assert!(probe.point.hit_reduction_matches);
+        assert_eq!(probe.point.accuracy, accuracy[2]);
+    }
+}
+
+#[test]
 fn iso_cube_hides_the_three_back_edges() {
     let def = prepare(&cuboid([0.; 3], [1.; 3]), &Options::default()).unwrap();
     let view = View::new(Vec3::new(-1., -1., -1.), Vec3::new(0., 0., 1.)).unwrap();
@@ -191,6 +393,59 @@ fn a_shallow_cut_through_a_torus_tube_is_found() {
     let hits: Vec<f64> = roots.iter().filter(|(_, grazing)| !grazing).map(|(l, _)| *l).collect();
     let half = (25f64 - 4.99f64.powi(2)).sqrt();
     assert!(hits.len() == 2 && (hits[0] - (10. - half)).abs() < 1e-6 && (hits[1] - (10. + half)).abs() < 1e-6, "{roots:?}");
+}
+
+#[test]
+fn torus_exact_plane_tangencies_keep_zero_samples_and_separate_crossings_from_misses() {
+    // At z = r, the horizontal section is exactly the major circle: two double contacts.
+    let roots = surface::torus_roots(Vec3::new(0., -40., 5.), Vec3::Y, Vec3::Z, 20., 5., [0., 80.]);
+    assert_eq!(roots.len(), 2, "{roots:?}");
+    for ((got, grazing), want) in roots.iter().zip([20., 60.]) {
+        assert!(*grazing && (got - want).abs() < 1e-10, "{roots:?}");
+    }
+    assert!(surface::torus_roots(Vec3::new(0., -40., 5.0001), Vec3::Y, Vec3::Z, 20., 5., [0., 80.]).is_empty());
+    // At z = 3 the cross-section has radii 20 +- 4, hence four simple crossings.
+    let roots = surface::torus_roots(Vec3::new(0., -40., 3.), Vec3::Y, Vec3::Z, 20., 5., [0., 80.]);
+    assert_eq!(roots.len(), 4, "{roots:?}");
+    for ((got, grazing), want) in roots.iter().zip([16., 24., 56., 64.]) {
+        assert!(!grazing && (got - want).abs() < 1e-10, "{roots:?}");
+    }
+}
+
+#[test]
+fn torus_shallow_axial_chord_is_not_lost_at_the_first_clipped_sampling_cell() {
+    // A 0.5 mm tube, entered only 1e-9 mm inside its outer equator. The two roots
+    // are about 0.000063 mm apart, much shorter than the old subdivision floor.
+    let rho: f64 = 30.5 - 1e-9;
+    let half = ((0.5 - (rho - 30.)) * (0.5 + (rho - 30.))).sqrt();
+    for start in [39.99992, 39.9999, 39.9998] {
+        let roots = surface::torus_roots(Vec3::new(rho, 0., -40.), Vec3::Z, Vec3::Z, 30., 0.5, [start, 40.50008]);
+        assert_eq!(roots.len(), 2, "start {start}: {roots:?}");
+        for ((got, grazing), want) in roots.iter().zip([40. - half, 40. + half]) {
+            assert!(!grazing && (got - want).abs() < 1e-10, "{roots:?}");
+        }
+    }
+    assert!(surface::torus_roots(Vec3::new(30.5001, 0., -40.), Vec3::Z, Vec3::Z, 30., 0.5, [39., 41.]).is_empty());
+}
+
+#[test]
+fn circular_sections_near_the_ray_start_keep_roundoff_contacts_but_reject_clear_misses() {
+    // These two surfaces both have radius 9.5 in the plane z = 9.5. At y = 8.6e-8
+    // the radial excess is below one ulp: subtracting squared distances cannot
+    // support certain visibility. At y = 0.001 the forward ray is a clear miss.
+    for analytic in [
+        surface::Analytic::Cylinder { p: Vec3::ZERO, a: Vec3::Z, r: 9.5 },
+        surface::Analytic::Cone { apex: Vec3::ZERO, a: Vec3::Z, half: std::f64::consts::FRAC_PI_4 },
+    ] {
+        let s = surface::S3::from_analytic(&analytic, [1., 20.], Vec3::X).unwrap();
+        for y in [-8.6e-8, 8.6e-8] {
+            let contacts = s.near_contacts(&analytic, Vec3::new(9.5, y, 9.5), Vec3::Y, [1e-10, 10.], 0.);
+            assert!(!contacts.is_empty(), "{analytic:?}, y {y}");
+        }
+        for p in [Vec3::new(9.5001, 0., 9.5), Vec3::new(9.5, 0.001, 9.5)] {
+            assert!(s.near_contacts(&analytic, p, Vec3::Y, [1e-10, 10.], 0.).is_empty());
+        }
+    }
 }
 
 /// A frame at `o` with x along +X and y along +Y (z along +Z).

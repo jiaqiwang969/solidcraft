@@ -114,3 +114,61 @@ fn a_result_with_an_edge_that_does_not_evaluate_is_refused() {
     assert!(!crate::boolean_record::edges_evaluate(&solid(1.0)));
     assert!(crate::boolean_record::edges_evaluate(&solid(0.0)));
 }
+
+/// A rounded axial slot crossing a conical shoulder keeps the specified cutter
+/// planes; changing their position to make a Boolean work changes the part.
+#[test]
+fn shoulder_slot_preserves_the_analytic_cutting_planes() {
+    use crate::boolean_diagnostics::capture_boolean_diagnostics;
+    use solidcraft_geom::{Loop2, Plane as ProfilePlane, Region2, Seg2, Vec2};
+    let points = [
+        (0., 0.),
+        (0., 12.5),
+        (25., 12.5),
+        (25., 15.),
+        (45., 15.),
+        (55., 20.),
+        (100., 20.),
+        (100., 24.),
+        (125., 24.),
+        (125., 21.),
+        (180., 21.),
+        (180., 0.),
+    ];
+    let region = Region2 { outer: Loop2::polygon(&points.map(|(x, y)| Vec2::new(x, y))), holes: vec![] };
+    let shaft = crate::revolve(&ProfilePlane::XY, &[region], Vec2::ZERO, Vec2::X, std::f64::consts::TAU).unwrap().remove(0);
+    let a = Vec2::new(-10., -4.);
+    let b = Vec2::new(100., -4.);
+    let c = Vec2::new(100., 4.);
+    let d = Vec2::new(-10., 4.);
+    let slot = Region2 {
+        outer: Loop2 {
+            segs: vec![
+                Seg2::Line { a, b },
+                Seg2::Arc { center: Vec2::new(100., 0.), radius: 4., start: -std::f64::consts::FRAC_PI_2, sweep: std::f64::consts::PI },
+                Seg2::Line { a: c, b: d },
+                Seg2::Line { a: d, b: a },
+            ],
+        },
+        holes: vec![],
+    };
+    let tool = crate::extrude_planar_regions(&ProfilePlane::XZ, &[slot], 16., 56.).unwrap();
+    for tol in [0.36, 0.09, 0.01, 0.001, 0.0001] {
+        let raw = crate::ops::truck_boolean(&shaft, &tool, crate::BoolOp::Cut, None, tol);
+        match raw {
+            Ok((solid, _)) => eprintln!("DIRECT {tol}: shells={}, faces={}", solid.boundaries().len(), solid.face_iter().count()),
+            Err(error) => eprintln!("DIRECT {tol}: {error}"),
+        }
+    }
+    let (cut, diagnostics) = capture_boolean_diagnostics(|| crate::boolean(&shaft, &tool, crate::BoolOp::Cut));
+    let cut = cut.unwrap().unwrap();
+    assert!(diagnostics.warning().is_none(), "{diagnostics:?}");
+    assert_eq!(cut.shell_count(), 1);
+    assert!(cut.history().is_some());
+    let floors: Vec<_> = (0..cut.face_count()).filter_map(|i| cut.planar_face(i)).filter(|p| p.normal().y.abs() > 0.99).collect();
+    assert!(!floors.is_empty());
+    for p in floors {
+        assert!((p.origin.y - 16.).abs() < 1e-8, "{p:?}");
+        assert!(p.normal().x.abs() < 1e-9 && p.normal().z.abs() < 1e-9, "{p:?}");
+    }
+}

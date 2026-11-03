@@ -35,10 +35,18 @@ pub static COMMANDS: &[CommandSpec] = &[
          never on a selection or a view; from one counter for the whole run, so it never repeats). Read-only",
     ),
     CommandSpec::new("sketch.inspect", "Inspect Sketch", sketch_inspect).icon("inspect").noundo().params("sketch?: id|name (default active)"),
-    CommandSpec::new("model.edges", "List Edges", model_edges).icon("inspect").noundo().params("body: name"),
-    CommandSpec::new("model.faces", "List Faces", model_faces).icon("inspect").noundo().params(
+    CommandSpec::new("model.edges", "List Edges", crate::checked!("model.edges", model_edges)).icon("inspect").noundo()
+        .contract(&MODEL_FACES_CONTRACT)
+        .output(crate::schema::output_schema_for::<crate::schema::inspect::ModelEdgesResult>)
+        .params("body: name → edges with index, name, polyline mid/length and curve endpoints; circle? has kernel-recognized center, axis, radius, start, end and angle_rad; curve_tolerance_mm is recognition tolerance, not a manufacturing tolerance"),
+    CommandSpec::new("model.faces", "List Faces", crate::checked!("model.faces", model_faces)).icon("inspect").noundo()
+        .contract(&MODEL_FACES_CONTRACT)
+        .output(crate::schema::output_schema_for::<crate::schema::inspect::ModelFacesResult>).params(
         "body: name → per face: index, name (what face.delete, sheet.convert `face`, solid.shell … take in place of a point), exact, area, centroid (not always on the face), \
          plane_normal, point (a point on the face that picks it), cylinder? ({origin, axis, radius} of a cylindrical face), \
+         analytic_surface? (kernel-recognized plane, cylinder, cone, sphere or torus; world coordinates in mm, cone half_angle_rad in radians), \
+         analytic_tolerance_mm? (surface recognition tolerance, not a manufacturing tolerance; exact above describes the face name), \
+         boundary_edges (indices in model.edges, including seams, from native topology adjacency), \
          sheet_face? (a folded sheet's face: `sheet:<body>:<panel>:<side>`, panel base or a flange's tag F<feature>.<k>, side top | bottom | rim.<edge> | bend.inner | bend.outer; \
          taken wherever a face name is, and it holds while sizes change and flanges come and go)",
     ),
@@ -390,7 +398,15 @@ fn model_edges(s: &mut Session, p: &Value) -> Result<Value> {
         .body
         .edges(tol)?
         .iter()
-        .map(|e| json!({"index": e.index, "name": names.get(e.index), "mid": e.mid, "length": e.length, "start": e.points.first(), "end": e.points.last()}))
+        .map(|e| {
+            let mut value = json!({"index": e.index, "name": names.get(e.index), "mid": e.mid, "length": e.length, "start": e.points.first(), "end": e.points.last()});
+            if let (Some(circle), Some(o)) = (solidcraft_kernel::edge_circle(&b.body, e.index), value.as_object_mut()) {
+                o.insert("circle".into(), json!({"center":circle.center, "axis":circle.axis, "radius":circle.radius,
+                    "start":circle.start, "end":circle.end, "angle_rad":circle.angle}));
+                o.insert("curve_tolerance_mm".into(), json!((b.body.size() * 1e-7).max(1e-9) * 100.0));
+            }
+            value
+        })
         .collect();
     Ok(json!({"body": b.name, "edges": edges}))
 }
@@ -401,6 +417,15 @@ fn model_faces(s: &mut Session, p: &Value) -> Result<Value> {
     let names = solidcraft_doc::naming::face_names(b);
     let tol = (b.body.size() * 2e-3).max(1e-3);
     let spots = solidcraft_doc::naming::face_spots(b);
+    let mesh = b.body.tessellate(tol)?;
+    let mut boundary_edges = vec![Vec::new(); b.body.face_count()];
+    for (edge, faces) in mesh.edge_faces.iter().enumerate() {
+        for face in faces {
+            if let Some(edges) = boundary_edges.get_mut(*face as usize) {
+                edges.push(edge);
+            }
+        }
+    }
     // A folded sheet's faces also have the readable names its sheet gives them, worked out in
     // the body's own coordinates.
     let model = s.model.state();
@@ -412,7 +437,8 @@ fn model_faces(s: &mut Session, p: &Value) -> Result<Value> {
         .map(|f| {
             let spot = spots.get(f.index).copied().flatten();
             let mut v = json!({"index": f.index, "name": names.get(f.index), "exact": solidcraft_doc::naming::face_name_exact(b, f.index),
-                   "area": f.area, "centroid": f.centroid, "plane_normal": f.plane_normal, "point": spot.map(|x| x.point)});
+                   "area": f.area, "centroid": f.centroid, "plane_normal": f.plane_normal, "point": spot.map(|x| x.point),
+                   "boundary_edges": boundary_edges.get(f.index).cloned().unwrap_or_default()});
             if let (Some(Some(name)), Some(o)) = (sheet_names.get(f.index), v.as_object_mut()) {
                 o.insert("sheet_face".into(), json!(name));
             }
@@ -421,6 +447,22 @@ fn model_faces(s: &mut Session, p: &Value) -> Result<Value> {
             {
                 o.insert("cylinder".into(), json!({"origin": origin, "axis": axis, "radius": radius}));
             }
+            if let (Some(surface), Some(o)) = (spot.and_then(|x| x.surface), v.as_object_mut()) {
+                use solidcraft_kernel::FaceSurface;
+                let surface = match surface {
+                    FaceSurface::Plane { normal, point } => json!({"kind":"plane", "normal":normal, "point":point}),
+                    FaceSurface::Cylinder { origin, axis, radius } => json!({"kind":"cylinder", "origin":origin, "axis":axis, "radius":radius}),
+                    FaceSurface::Cone { apex, axis, half_angle } => json!({"kind":"cone", "apex":apex, "axis":axis, "half_angle_rad":half_angle}),
+                    FaceSurface::Sphere { center, radius } => json!({"kind":"sphere", "center":center, "radius":radius}),
+                    FaceSurface::Torus { center, axis, major, minor } => {
+                        json!({"kind":"torus", "center":center, "axis":axis, "major_radius":major, "minor_radius":minor})
+                    }
+                };
+                o.insert("analytic_surface".into(), surface);
+                // The existing kernel classifier owns recognition. No geometry is
+                // inferred from the feature's requested chamfer or fillet size here.
+                o.insert("analytic_tolerance_mm".into(), json!((b.body.size() * 1e-7).max(1e-9) * 100.0));
+            }
             v
         })
         .collect();
@@ -428,6 +470,7 @@ fn model_faces(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 const DESCRIBE_CONTRACT: crate::schema::TypedContract<crate::schema::inspect::DescribeParams> = crate::schema::TypedContract::new();
+const MODEL_FACES_CONTRACT: crate::schema::TypedContract<crate::schema::inspect::ModelFacesParams> = crate::schema::TypedContract::new();
 
 /// A command's prose documentation and, for converted commands, its schemas.
 fn describe(_s: &mut Session, p: &Value) -> Result<Value> {

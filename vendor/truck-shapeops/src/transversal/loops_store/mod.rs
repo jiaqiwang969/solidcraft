@@ -159,6 +159,25 @@ impl ParameterKind {
 }
 
 impl<P: Copy + Tolerance, C: Clone> Loops<P, C> {
+    // A traced intersection that is already a boundary does not divide the face.
+    // Its orientation still classifies the adjacent piece. Adding it twice made
+    // a zero-width digon (or a wire returning through the same vertices).
+    fn classify_boundary(&mut self, edge: &Edge<P, C>, status: ShapesOpStatus) -> Option<bool> {
+        let mut found = false;
+        for wire in self.iter_mut() {
+            let existing = wire.iter().find(|candidate| candidate.id() == edge.id());
+            if let Some(existing) = existing {
+                let adjacent = if existing.orientation() == edge.orientation() { status } else { status.not() };
+                if wire.status != ShapesOpStatus::Unknown && wire.status != adjacent {
+                    return None;
+                }
+                wire.status = adjacent;
+                found = true;
+            }
+        }
+        Some(found)
+    }
+
     fn search_parameter(&self, pt: P) -> Option<(usize, usize, ParameterKind)>
     where C: BoundedCurve<Point = P> + SearchParameter<D1, Point = P> {
         self.iter()
@@ -569,6 +588,69 @@ pub struct LoopsStoreQuadruple<C> {
     pub poly_loops_store1: LoopsStore<Point3, PolylineCurve>,
 }
 
+// Coincident endpoints alone are insufficient: two different arcs can share
+// them. Check both curves against the other at bounded interior parameters,
+// with a fixed geometric tolerance independent of the whole operand's size.
+fn same_boundary_curve<C>(a: &C, b: &C) -> bool
+where
+    C: BoundedCurve<Point = Point3> + SearchNearestParameter<D1, Point = Point3>,
+{
+    let on = |source: &C, target: &C| {
+        let (lo, hi) = source.range_tuple();
+        let (tlo, thi) = target.range_tuple();
+        if ![lo, hi, tlo, thi].iter().all(|t| t.is_finite()) || hi < lo || thi < tlo { return false; }
+        (0..=16).all(|i| {
+            let p = source.subs(lo + (hi - lo) * i as f64 / 16.0);
+            let Some(t) = target.search_nearest_parameter(p, None, 100) else { return false };
+            t.is_finite() && t >= tlo - 1e-12 && t <= thi + 1e-12
+                && p.distance(target.subs(t.clamp(tlo, thi))) <= 1e-9
+        })
+    };
+    let _ = truck_geometry::prelude::take_projection_failure();
+    let same = on(a, b) && on(b, a);
+    let failed = truck_geometry::prelude::take_projection_failure();
+    same && !failed
+}
+
+fn matching_boundary<C>(
+    geom: &Loops<Point3, C>,
+    poly: &Loops<Point3, PolylineCurve>,
+    edge: &Edge<Point3, C>,
+) -> Option<(Edge<Point3, C>, Edge<Point3, PolylineCurve>)>
+where
+    C: Clone + BoundedCurve<Point = Point3> + SearchNearestParameter<D1, Point = Point3>,
+{
+    for (wi, wire) in geom.iter().enumerate() {
+        for (ei, candidate) in wire.iter().enumerate() {
+            let forward = candidate.front() == edge.front() && candidate.back() == edge.back();
+            let backward = candidate.front() == edge.back() && candidate.back() == edge.front();
+            if (forward || backward) && same_boundary_curve(&candidate.curve(), &edge.curve()) {
+                let mirror = poly.get(wi)?.get(ei)?;
+                return Some(if forward { (candidate.clone(), mirror.clone()) } else { (candidate.inverse(), mirror.inverse()) });
+            }
+        }
+    }
+    None
+}
+
+fn replace_boundary<C, S>(
+    geom: &mut LoopsStore<Point3, C>,
+    poly: &mut LoopsStore<Point3, PolylineCurve>,
+    old: &(Edge<Point3, C>, Edge<Point3, PolylineCurve>),
+    new: &(Edge<Point3, C>, Edge<Point3, PolylineCurve>),
+    lineage: &mut Lineage<C, S>,
+) where C: Clone {
+    if old.0.id() != new.0.id() {
+        let replacement = if old.0.orientation() { new.0.clone() } else { new.0.inverse() };
+        geom.swap_edge_into_wire(old.0.id(), &vec![replacement].into());
+        lineage.edge_piece(old.0.id(), new.0.id());
+    }
+    if old.1.id() != new.1.id() {
+        let replacement = if old.1.orientation() { new.1.clone() } else { new.1.inverse() };
+        poly.swap_edge_into_wire(old.1.id(), &vec![replacement].into());
+    }
+}
+
 pub fn create_loops_stores<C, S>(
     geom_shell0: &Shell<Point3, C, S>,
     poly_shell0: &Shell<Point3, PolylineCurve, Option<PolygonMesh>>,
@@ -576,6 +658,7 @@ pub fn create_loops_stores<C, S>(
     poly_shell1: &Shell<Point3, PolylineCurve, Option<PolygonMesh>>,
     tol: f64,
     lineage: &mut Lineage<C, S>,
+    roundoff_contacts: bool,
 ) -> Option<LoopsStoreQuadruple<C>>
 where
     C: SearchNearestParameter<D1, Point = Point3>
@@ -606,6 +689,7 @@ where
                 surface1.clone(),
                 &polygon1,
                 tol,
+                roundoff_contacts,
             )
             .into_iter()
             .try_for_each(|(polyline, intersection_curve)| {
@@ -694,8 +778,16 @@ where
                         let polyline = intersection_curve.editor().leader;
                         *polyline.last_mut().unwrap() = gv1.point();
                     }
-                    let pedge = Edge::new(&pv0, &pv1, polyline);
-                    let gedge = Edge::new(&gv0, &gv1, intersection_curve.into());
+                    let mut pedge = Edge::new(&pv0, &pv1, polyline);
+                    let mut gedge = Edge::new(&gv0, &gv1, intersection_curve.into());
+                    let on0 = matching_boundary(&geom_loops_store0[face_index0], &poly_loops_store0[face_index0], &gedge);
+                    let on1 = matching_boundary(&geom_loops_store1[face_index1], &poly_loops_store1[face_index1], &gedge);
+                    if let Some(shared) = on0.as_ref().or(on1.as_ref()) {
+                        if let Some(old) = &on0 { replace_boundary(&mut geom_loops_store0, &mut poly_loops_store0, old, shared, lineage); }
+                        if let Some(old) = &on1 { replace_boundary(&mut geom_loops_store1, &mut poly_loops_store1, old, shared, lineage); }
+                        gedge = shared.0.clone();
+                        pedge = shared.1.clone();
+                    }
                     lineage.meet(gedge.id(), meeting);
                     let normal_at = |surface: &S, p: Point3| -> Option<Vector3> {
                         let (u, v) = surface.search_nearest_parameter(p, None, 100)?;
@@ -703,10 +795,18 @@ where
                     };
                     let normals0 = [normal_at(&surface0, gv1.point()), normal_at(&surface0, gv0.point())];
                     let normals1 = [normal_at(&surface1, gv1.point()), normal_at(&surface1, gv0.point())];
-                    let chosen0 = poly_loops_store0[face_index0].add_edge_by_angle(pedge.clone(), status0, normals0);
-                    geom_loops_store0[face_index0].add_edge_at(gedge.clone(), status0, chosen0);
-                    let chosen1 = poly_loops_store1[face_index1].add_edge_by_angle(pedge, status1, normals1);
-                    geom_loops_store1[face_index1].add_edge_at(gedge, status1, chosen1);
+                    let boundary0 = poly_loops_store0[face_index0].classify_boundary(&pedge, status0)?;
+                    if boundary0 != geom_loops_store0[face_index0].classify_boundary(&gedge, status0)? { return None; }
+                    if !boundary0 {
+                        let chosen0 = poly_loops_store0[face_index0].add_edge_by_angle(pedge.clone(), status0, normals0);
+                        geom_loops_store0[face_index0].add_edge_at(gedge.clone(), status0, chosen0);
+                    }
+                    let boundary1 = poly_loops_store1[face_index1].classify_boundary(&pedge, status1)?;
+                    if boundary1 != geom_loops_store1[face_index1].classify_boundary(&gedge, status1)? { return None; }
+                    if !boundary1 {
+                        let chosen1 = poly_loops_store1[face_index1].add_edge_by_angle(pedge, status1, normals1);
+                        geom_loops_store1[face_index1].add_edge_at(gedge, status1, chosen1);
+                    }
                 }
                 Some(())
             })

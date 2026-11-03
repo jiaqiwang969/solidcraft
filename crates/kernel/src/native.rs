@@ -7,8 +7,11 @@ use std::sync::Arc;
 
 mod adapter;
 mod binary;
+mod drawing;
 mod metadata;
 mod preview;
+mod refine;
+pub use drawing::{DrawingBody, DrawingEdgeSource, IntersectionSampling, drawing_body};
 pub use preview::native_preview_mesh;
 
 // 01/02 were development-only prototypes; independent metadata records start at 03; 04 stores
@@ -44,6 +47,13 @@ struct Runtime {
 }
 fn invalid(detail: impl std::fmt::Display) -> KernelError {
     KernelError::Invalid(format!("native B-rep: {detail}"))
+}
+
+/// Read-only portable topology and the producer's own curve/surface records.
+/// This does not fit procedural intersections or certify them for a drawing.
+pub fn portable_body(body: &Body) -> Result<solidcraft_geom::brep::Brep> {
+    body.require_brep("portable drawing source")?;
+    guard("portable drawing source", || adapter::encode(&body.solid))
 }
 
 /// Explicit topology, spatial geometry, construction certificates and history, exactly.
@@ -207,6 +217,103 @@ fn value_nodes(v: &Value) -> usize {
 mod tests {
     use super::*;
     use solidcraft_geom::Vec3;
+
+    #[test]
+    fn drawing_source_maps_native_edges_and_traces_actual_cross_drill() {
+        use solidcraft_geom::brep::Curve;
+        use solidcraft_geom::section::CurveAccuracy;
+        use std::collections::HashMap;
+        let parent = crate::cylinder(Vec3::ZERO, Vec3::X, 10., 40.).unwrap();
+        let tool = crate::cylinder(Vec3::new(20., 0., -15.), Vec3::Z, 3., 30.).unwrap();
+        let body = crate::boolean(&parent, &tool, crate::BoolOp::Cut).unwrap().unwrap();
+        let saved = encode_native_body(&body).unwrap();
+        let adapted = drawing_body(&body, 1e-6).unwrap();
+        assert_eq!(saved, encode_native_body(&body).unwrap(), "drawing must not mutate the native model");
+        assert_eq!(adapted.edges.len(), body.edge_count());
+        assert_eq!(adapted.faces.len(), body.face_count());
+        let native = crate::body::edge_order(body.solid.face_iter()).0;
+        let index: HashMap<_, _> = native.iter().enumerate().map(|(i, e)| (e.id(), i)).collect();
+        let mut base_edge = 0;
+        let mut base_face = 0;
+        let native_faces: Vec<_> = body.solid.face_iter().collect();
+        let mut sampled = 0;
+        for shell in &adapted.brep.shells {
+            for (i, e) in shell.edges.iter().enumerate() {
+                let binding = &adapted.edges[base_edge + i];
+                let source = &native[binding.kernel_edge];
+                for (actual, expected) in
+                    e.vertices.iter().map(|v| shell.vertices[*v as usize]).zip([source.absolute_front().point(), source.absolute_back().point()])
+                {
+                    assert!((Vec3::from(actual) - Vec3::new(expected.x, expected.y, expected.z)).len() < 1e-10);
+                }
+                if let CurveAccuracy::Sampled { max_sample_deviation_mm } = binding.accuracy {
+                    sampled += 1;
+                    assert!(max_sample_deviation_mm <= 1e-6);
+                    let observed = binding.intersection_sampling.as_ref().unwrap();
+                    assert!(observed.max_support_residual_mm <= 1e-8);
+                    assert!(observed.max_native_correction_mm <= 8e-6);
+                    let Curve::Polyline { points } = &e.curve else { panic!("sampled intersection") };
+                    assert_eq!(points.len(), binding.native_parameters.len());
+                    for &[x, y, z] in points {
+                        assert!(
+                            (y.hypot(z) - 10.).abs() < 1e-7,
+                            "parent cylinder: edge {}, point {:?}, residual {}",
+                            binding.kernel_edge,
+                            [x, y, z],
+                            y.hypot(z) - 10.
+                        );
+                        assert!(
+                            ((x - 20.).hypot(y) - 3.).abs() < 1e-7,
+                            "cross drill: edge {}, point {:?}, residual {}",
+                            binding.kernel_edge,
+                            [x, y, z],
+                            (x - 20.).hypot(y) - 3.
+                        );
+                    }
+                }
+            }
+            for (i, f) in shell.faces.iter().enumerate() {
+                let mut got: Vec<_> = f.loops.iter().flatten().map(|e| (adapted.edges[base_edge + e.edge as usize].kernel_edge, e.forward)).collect();
+                let mut expected: Vec<_> =
+                    native_faces[adapted.faces[base_face + i]].edge_iter().map(|e| (index[&e.id()], e.orientation())).collect();
+                got.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(got, expected, "oriented incidence");
+            }
+            base_edge += shell.edges.len();
+            base_face += shell.faces.len();
+        }
+        assert!(sampled > 0);
+        assert!(adapted.edges.iter().enumerate().any(|(i, e)| i != e.kernel_edge), "fixture must exercise different edge orders");
+        assert!(drawing_body(&body, f64::NAN).is_err());
+        assert!(drawing_body(&body, 0.).is_err());
+    }
+
+    #[test]
+    fn drawing_source_preserves_a_placed_revolution_support() {
+        use solidcraft_geom::{Loop2, Plane, Region2, Vec2};
+        let region =
+            Region2 { outer: Loop2::polygon(&[Vec2::new(0., 0.), Vec2::new(12., 0.), Vec2::new(12., 5.), Vec2::new(0., 5.)]), holes: vec![] };
+        let body = crate::revolve(&Plane::XY, &[region], Vec2::ZERO, Vec2::X, std::f64::consts::TAU).unwrap().remove(0);
+        let body = crate::transform(&body, Vec3::new(3., 7., 11.), Vec3::ZERO, Vec3::Y, 0.37).unwrap();
+        assert!(
+            portable_body(&body)
+                .unwrap()
+                .shells
+                .iter()
+                .flat_map(|s| &s.faces)
+                .any(|f| matches!(f.surface, solidcraft_geom::brep::Surface::PlacedRevolution { .. }))
+        );
+        let source = drawing_body(&body, 1e-6).unwrap();
+        let accuracy: Vec<_> = source.edges.iter().map(|e| e.accuracy).collect();
+        let p = solidcraft_geom::hlr::prepare_with_accuracy(&source.brep, Some(&accuracy), &Default::default(), &|| false).unwrap();
+        let cylinders = p.report.surfaces.get("cylinder").copied().unwrap_or(0);
+        let planes = p.report.surfaces.get("plane").copied().unwrap_or(0);
+        assert!(cylinders > 0);
+        assert_eq!(cylinders + planes, body.face_count());
+        assert!(p.report.unsupported_trims.is_empty());
+        assert!(p.report.freeform_faces.is_empty());
+    }
     fn equal(a: &Body, b: &Body) {
         assert_eq!(a.face_count(), b.face_count());
         assert_eq!(a.face_sources, b.face_sources);

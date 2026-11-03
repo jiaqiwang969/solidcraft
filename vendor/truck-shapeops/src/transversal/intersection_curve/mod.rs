@@ -156,6 +156,7 @@ pub fn intersection_curves<S>(
     surface1: S,
     polygon1: &PolygonMesh,
     tol: f64,
+    roundoff_contacts: bool,
 ) -> Vec<(
     PolylineCurve<Point3>,
     Option<IntersectionCurveWithParameters<S>>,
@@ -163,7 +164,11 @@ pub fn intersection_curves<S>(
 where
     S: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>,
 {
-    let interferences = polygon0.extract_interference(polygon1);
+    let interferences = if roundoff_contacts {
+        extract_roundoff_interference(polygon0, polygon1)
+    } else {
+        polygon0.extract_interference(polygon1)
+    };
     let polylines = super::polyline_construction::construct_polylines(&interferences);
     polylines
         .into_iter()

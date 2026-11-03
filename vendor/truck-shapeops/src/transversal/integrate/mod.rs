@@ -95,6 +95,7 @@ fn process_one_pair_of_shells<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     tol: f64,
     lineage: &mut Lineage<C, S>,
     and: bool,
+    roundoff_contacts: bool,
 ) -> Option<[Shell<Point3, C, S>; 2]> {
     nonpositive_tolerance!(tol);
     // SolidCraft: robust meshing (boundaries from earlier operations lie on surfaces only
@@ -108,7 +109,7 @@ fn process_one_pair_of_shells<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         geom_loops_store0: loops_store0,
         geom_loops_store1: loops_store1,
         ..
-    } = crate::tr!(loops_store::create_loops_stores(shell0, &poly_shell0, shell1, &poly_shell1, tol, lineage), "loops stores");
+    } = crate::tr!(loops_store::create_loops_stores(shell0, &poly_shell0, shell1, &poly_shell1, tol, lineage, roundoff_contacts), "loops stores");
     let mut cls0 = crate::tr!(divide_face::divide_faces(shell0, &loops_store0, tol, lineage), "divide faces 0");
     cls0.integrate_by_component();
     let mut cls1 = crate::tr!(divide_face::divide_faces(shell1, &loops_store1, tol, lineage), "divide faces 1");
@@ -205,6 +206,22 @@ fn boolean<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     tol: f64,
     and: bool,
 ) -> Option<(Solid<Point3, C, S>, Option<History>)> {
+    // Preserve a successful construction exactly. If it fails, rebuild both
+    // loop stores and the lineage from the same operands, accounting only for
+    // arithmetic roundoff in mesh contact tests. Never move a tool or reuse a
+    // partially assembled shell from the failed attempt.
+    boolean_attempt(solid0, meshed0, solid1, tol, and, false)
+        .or_else(|| boolean_attempt(solid0, meshed0, solid1, tol, and, true))
+}
+
+fn boolean_attempt<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    solid0: &Solid<Point3, C, S>,
+    meshed0: Option<&[MeshedShell]>,
+    solid1: &Solid<Point3, C, S>,
+    tol: f64,
+    and: bool,
+    roundoff_contacts: bool,
+) -> Option<(Solid<Point3, C, S>, Option<History>)> {
     let pick = |[and_shell, or_shell]: [Shell<Point3, C, S>; 2]| if and { and_shell } else { or_shell };
     let mut lineage = Lineage::new([solid0, solid1]);
     let mut iter0 = solid0.boundaries().iter();
@@ -212,9 +229,9 @@ fn boolean<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     let shell0 = iter0.next()?;
     let shell1 = iter1.next()?;
     let meshed0 = meshed0.filter(|m| m.len() == solid0.boundaries().len()).and_then(|m| m.first());
-    let mut shell = pick(crate::tr!(process_one_pair_of_shells(shell0, meshed0, shell1, tol, &mut lineage, and), "first shells"));
+    let mut shell = pick(crate::tr!(process_one_pair_of_shells(shell0, meshed0, shell1, tol, &mut lineage, and, roundoff_contacts), "first shells"));
     for other in iter0.chain(iter1) {
-        shell = pick(crate::tr!(process_one_pair_of_shells(&shell, None, other, tol, &mut lineage, and), "another shell"));
+        shell = pick(crate::tr!(process_one_pair_of_shells(&shell, None, other, tol, &mut lineage, and, roundoff_contacts), "another shell"));
     }
     let solid = crate::tr!(Solid::try_new(components_in_order(&shell)).ok(), "result solid");
     let history = lineage.history(&solid);

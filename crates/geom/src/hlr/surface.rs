@@ -111,6 +111,16 @@ pub(crate) struct Hit {
     pub grazing: bool,
 }
 
+/// A tangent surface point close to a ray, not an intersection of that ray. It can
+/// explain sensitivity to the input curve's declared error or arithmetic roundoff.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NearContact {
+    pub lam: f64,
+    pub uv: [f64; 2],
+    pub distance_mm: f64,
+    pub margin_mm: f64,
+}
+
 fn perp(a: Vec3) -> Vec3 {
     a.any_perp().normalized().unwrap_or(Vec3::new(1., 0., 0.))
 }
@@ -356,7 +366,8 @@ impl S3 {
     }
 
     /// Ray hits using the recognised analytic form when there is one (closed form for
-    /// quadrics, a sampled quartic for tori), else the record's own intersection.
+    /// quadrics and axial torus sections, bounded sampling for oblique torus rays), else
+    /// the record's own intersection.
     pub fn ray_as(&self, an: &Analytic, p0: Vec3, d: Vec3, range: [f64; 2], out: &mut Vec<Hit>) {
         let lams = match *an {
             Analytic::Cylinder { p, a, r } => {
@@ -389,6 +400,84 @@ impl S3 {
         }
     }
 
+    /// Sensitivity at circular cylinder/cone sections, axial torus equators, and the
+    /// torus's extremal perpendicular planes. Sampled error remains sampled evidence,
+    /// not an interval certificate; other tangencies are not qualified by this check.
+    pub fn near_contacts(&self, an: &Analytic, p0: Vec3, d: Vec3, range: [f64; 2], source_error: f64) -> Vec<NearContact> {
+        let circle = match *an {
+            Analytic::Cylinder { p, a, r } if d.dot(a) == 0. => Some((p, a, r)),
+            Analytic::Cone { apex, a, half } if d.dot(a) == 0. && (p0 - apex).dot(a) > 0. => Some((apex, a, (p0 - apex).dot(a) * half.tan())),
+            _ => None,
+        };
+        if let Some((o, a, r)) = circle {
+            let w = p0 - o;
+            let z = w.dot(a);
+            let wp = w - a * z;
+            let qa = d.dot(d);
+            if qa == 0. || r <= 0. {
+                return Vec::new();
+            }
+            let margin = source_error + 64. * f64::EPSILON * (1. + w.len() + r);
+            let centre = -wp.dot(d) / qa;
+            let closest = (wp + d * centre).len();
+            let mut candidates = Vec::new();
+            if (closest - r).abs() <= margin {
+                // The exact tangent can lie just behind the ray's start while roundoff
+                // still permits a short crossing in front. Check the nearest point of
+                // the finite ray against the circle instead of dropping that contact.
+                let lam = centre.max(range[0]).min(range[1]);
+                if let Some(unit) = (wp + d * lam).normalized() {
+                    candidates.push((lam, o + a * z + unit * r));
+                }
+            }
+            return self.contacts_from_points(candidates, p0, d, range, margin);
+        }
+        let Analytic::Torus { c, a, major, minor } = *an else { return Vec::new() };
+        let w = p0 - c;
+        let (z0, dz) = (w.dot(a), d.dot(a));
+        let (wp, dp) = (w - a * z0, d - a * dz);
+        // Local-coordinate arithmetic guard; it is not a user modelling tolerance.
+        let margin = source_error + 64. * f64::EPSILON * (1. + w.len() + major + minor);
+        let qa = dp.dot(dp);
+        let mut candidates = Vec::new();
+        if qa == 0. && dz != 0. {
+            let rho = wp.len();
+            if rho > 0. && ((rho - major).abs() - minor).abs() <= margin {
+                let radius = major + (rho - major).signum() * minor;
+                if radius >= 0. {
+                    candidates.push((-z0 / dz, c + wp * (radius / rho)));
+                }
+            }
+        } else if dz == 0. && qa > 0. && (z0.abs() - minor).abs() <= margin {
+            let centre = -wp.dot(dp) / qa;
+            let closest = (wp + dp * centre).len();
+            if closest <= major + margin {
+                let half = ((major - closest).max(0.) * (major + closest) / qa).sqrt();
+                for lam in [centre - half, centre + half] {
+                    let radial = wp + dp * lam;
+                    if let Some(unit) = radial.normalized() {
+                        candidates.push((lam, c + unit * major + a * (z0.signum() * minor)));
+                    }
+                }
+            }
+        }
+        self.contacts_from_points(candidates, p0, d, range, margin)
+    }
+
+    fn contacts_from_points(&self, candidates: Vec<(f64, Vec3)>, p0: Vec3, d: Vec3, range: [f64; 2], margin: f64) -> Vec<NearContact> {
+        candidates
+            .into_iter()
+            .filter_map(|(lam, p)| {
+                if !lam.is_finite() || lam < range[0] || lam > range[1] {
+                    return None;
+                }
+                let uv = self.inverse(p, None)?;
+                let distance = self.point(uv).dist(p0 + d * lam);
+                (distance <= margin).then_some(NearContact { lam, uv, distance_mm: distance, margin_mm: margin })
+            })
+            .collect()
+    }
+
     /// Which analytic surface this is, checked at sample points to `tol` relative to its size.
     pub fn analytic(&self, tol: f64) -> Analytic {
         match self {
@@ -417,9 +506,44 @@ pub(crate) fn quadratic(a: f64, b: f64, c: f64) -> Vec<(f64, bool)> {
     vec![(q / a, false), (c / q, false)]
 }
 
-/// Roots of the torus implicit function along a ray, by sampling and bisection; dips that
-/// touch zero without a sign change are grazing.
+/// Roots of the torus implicit function along a ray. Axial rays and rays in a plane
+/// perpendicular to the axis have circular sections, solved directly. The oblique case
+/// uses bounded sampling and bisection; dips without a sign change are grazing.
 pub(crate) fn torus_roots(w: Vec3, d: Vec3, a: Vec3, big: f64, small: f64, range: [f64; 2]) -> Vec<(f64, bool)> {
+    let (z0, dz) = (w.dot(a), d.dot(a));
+    let (wp, dp) = (w - a * z0, d - a * dz);
+    let qa = dp.dot(dp);
+    if qa == 0. && dz != 0. {
+        // The radial coordinate is constant. Factoring r^2 - (rho - R)^2 avoids
+        // subtracting large squared distances and keeps very short axial chords.
+        let radial = (wp.len() - big).abs();
+        if radial > small {
+            return Vec::new();
+        }
+        let half = ((small - radial) * (small + radial)).sqrt();
+        return section_roots(vec![((-half - z0) / dz, half == 0.), ((half - z0) / dz, half == 0.)], range);
+    }
+    if dz == 0. && qa > 0. {
+        // At |z| = r the two section circles coincide at R. They are double
+        // contacts even when a sampling grid happens to land exactly on zero.
+        if z0.abs() > small {
+            return Vec::new();
+        }
+        let radial_half = ((small - z0.abs()) * (small + z0.abs())).sqrt();
+        let centre = -wp.dot(dp) / qa;
+        let closest = (wp + dp * centre).len();
+        let mut out = Vec::new();
+        for radius in [big - radial_half, big + radial_half] {
+            if radius < 0. || closest > radius {
+                continue;
+            }
+            let half = ((radius - closest) * (radius + closest) / qa).sqrt();
+            let grazing = radial_half == 0. || half == 0.;
+            out.push((centre - half, grazing));
+            out.push((centre + half, grazing));
+        }
+        return section_roots(out, range);
+    }
     // Signed distance from the tube: distance to the centre circle less the tube radius,
     // computed directly (no quartic), so a thin tube on a large ring keeps its precision.
     let g = |l: f64| {
@@ -433,7 +557,6 @@ pub(crate) fn torus_roots(w: Vec3, d: Vec3, a: Vec3, big: f64, small: f64, range
     // The shell is padded: a crossing exactly on its surface (rho = R + r at z = 0, say) must
     // fall strictly inside a sampled piece.
     let m = 0.5 * small + 1e-9 * big;
-    let (z0, dz) = (w.dot(a), d.dot(a));
     let mut span = range;
     if dz.abs() > 1e-300 {
         let (l0, l1) = ((-small - m - z0) / dz, (small + m - z0) / dz);
@@ -442,7 +565,6 @@ pub(crate) fn torus_roots(w: Vec3, d: Vec3, a: Vec3, big: f64, small: f64, range
         return Vec::new();
     }
     // rho^2 along the ray: |w_perp + l d_perp|^2.
-    let (wp, dp) = (w - a * z0, d - a * dz);
     let (qa, qb, qc) = (dp.dot(dp), 2. * wp.dot(dp), wp.dot(wp));
     let within = |r2: f64| -> Option<[f64; 2]> {
         // Where rho^2 <= r2.
@@ -523,6 +645,22 @@ pub(crate) fn torus_roots(w: Vec3, d: Vec3, a: Vec3, big: f64, small: f64, range
     out.sort_by(|x, y| x.0.total_cmp(&y.0));
     out.dedup_by(|x, y| (x.0 - y.0).abs() <= fine && x.1 == y.1);
     out
+}
+
+/// Keep distinct circular-section crossings, however close. If two representable roots
+/// coincide, their multiplicity cannot support a certain crossing.
+fn section_roots(mut roots: Vec<(f64, bool)>, range: [f64; 2]) -> Vec<(f64, bool)> {
+    roots.retain(|(l, _)| l.is_finite() && *l >= range[0] && *l <= range[1]);
+    roots.sort_by(|x, y| x.0.total_cmp(&y.0));
+    roots.dedup_by(|x, y| {
+        if x.0 == y.0 {
+            y.1 = true;
+            true
+        } else {
+            false
+        }
+    });
+    roots
 }
 
 fn axes(f: &Frame) -> (Vec3, Vec3, Vec3, Vec3) {

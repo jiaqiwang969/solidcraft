@@ -7,7 +7,7 @@ mod splitting;
 mod topology;
 mod volume;
 
-pub use collision::Collision;
+pub use collision::{Collision, extract_roundoff_interference};
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use collision::test_hooks as collision_test_hooks;

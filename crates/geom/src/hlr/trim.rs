@@ -192,6 +192,10 @@ pub(crate) fn build(face: &Face, edges: &[C3], surface: &S3, per_break: usize) -
             let is_seam = uses.get(&u.edge).copied().unwrap_or(0) > 1;
             let mut ts = Vec::new();
             let b = c.breaks();
+            // A polyline break already bounds one straight chord. Repeating 256 points
+            // on that chord adds no source information; its adapter accuracy is kept by
+            // prepare_with_accuracy. Analytic curved records retain the existing sampling.
+            let per_break = if matches!(c, C3::Polyline(_)) { 1 } else { per_break };
             for w in b.windows(2) {
                 let (Some(t0), Some(t1)) = (w.first(), w.get(1)) else { continue };
                 for i in 0..per_break {

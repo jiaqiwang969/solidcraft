@@ -384,7 +384,7 @@ impl SharedCylinders {
         let (fa, fb) = (fa as usize, fb as usize);
         self.cylinders.iter().any(|c| {
             let (on_a, on_b) = (fa == c.faces.0, fb == c.faces.1);
-            ((on_a && on_b) || (on_a && c.caps.1.contains(&fb)) || (c.caps.0.contains(&fa) && on_b)) && c.holds(p, tol)
+            ((on_a && (on_b || c.caps.1.contains(&fb))) || (c.caps.0.contains(&fa) && on_b)) && c.holds(p, tol)
         })
     }
 
@@ -1766,6 +1766,12 @@ where
         }
         last = format!("{last}; the prisms joined in 2D gave an implausible volume {v:.4}");
     }
+    // A coarse guide can miss a small round's true intersection even when the same
+    // operands intersect reliably at the meeting region's scale. Exhaust those
+    // bounded, geometry-preserving tries before changing the tool's placement.
+    if let Some(body) = fine(&mut last) {
+        return Ok(Some(body));
+    }
     // Last resort: nudge the tool by a micron-scale screw motion (turned 2e-6 rad about a
     // skew axis and moved 2e-6 of the size), which breaks tangencies and seams lying exactly on
     // the other body. The result moves by no more than that.
@@ -1877,11 +1883,6 @@ where
             Some(Err(e)) => last = format!("{last}; {e}"),
             Some(Ok(None)) | None => {}
         }
-    }
-    // The tries at the meeting region's scale come last, after every strategy that answered
-    // before them, so a result any of those gave is kept as it was.
-    if let Some(body) = fine(&mut last) {
-        return Ok(Some(body));
     }
     // An intersection keeps what lies in both bodies: when the sampled answer keeps one of them
     // whole and is contradicted by facets that cross well past their faceting error, keeping it

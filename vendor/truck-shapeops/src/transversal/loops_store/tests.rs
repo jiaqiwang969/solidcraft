@@ -130,7 +130,7 @@ fn independent_intersection() {
         geom_loops_store0,
         geom_loops_store1,
         ..
-    } = create_loops_stores(&geom_shell0, &poly_shell0, &geom_shell1, &poly_shell1, TOL, &mut Default::default()).unwrap();
+    } = create_loops_stores(&geom_shell0, &poly_shell0, &geom_shell1, &poly_shell1, TOL, &mut Default::default(), false).unwrap();
 
     // check the topology
     let vertex_format = VertexDisplayFormat::AsPoint;
@@ -363,7 +363,7 @@ fn rotated_intersection() {
         geom_loops_store0,
         geom_loops_store1,
         ..
-    } = create_loops_stores(&geom_shell0, &poly_shell0, &geom_shell1, &poly_shell1, TOL, &mut Default::default()).unwrap();
+    } = create_loops_stores(&geom_shell0, &poly_shell0, &geom_shell1, &poly_shell1, TOL, &mut Default::default(), false).unwrap();
 
     let vertex_format = VertexDisplayFormat::AsPoint;
     let edge_id_format = EdgeDisplayFormat::VerticesTupleAndID { vertex_format };
@@ -612,7 +612,7 @@ fn crossing_edges() {
         geom_loops_store0,
         geom_loops_store1,
         ..
-    } = create_loops_stores(&geom_shell0, &poly_shell0, &geom_shell1, &poly_shell1, TOL, &mut Default::default()).unwrap();
+    } = create_loops_stores(&geom_shell0, &poly_shell0, &geom_shell1, &poly_shell1, TOL, &mut Default::default(), false).unwrap();
 
     let vertex_format = VertexDisplayFormat::AsPoint;
     let edge_id_format = EdgeDisplayFormat::VerticesTupleAndID { vertex_format };
@@ -773,4 +773,43 @@ fn crossing_edges() {
         "{:?}",
         geom_loops_store0.display(wire_id_format)
     );
+}
+
+#[test]
+fn shared_boundary_checks_both_curve_interiors() {
+    let p = |x, y| Point3::new(x, y, 0.0);
+    let line = PolylineCurve(vec![p(0.0, 0.0), p(1.0, 0.0)]);
+    let divided = PolylineCurve(vec![p(0.0, 0.0), p(0.2, 0.0), p(0.8, 0.0), p(1.0, 0.0)]);
+    let reversed = PolylineCurve(divided.iter().copied().rev().collect());
+    let bowed = PolylineCurve(vec![p(0.0, 0.0), p(0.5, 0.001), p(1.0, 0.0)]);
+    let displaced = PolylineCurve(vec![p(0.0, 0.000001), p(1.0, 0.000001)]);
+    assert!(same_boundary_curve(&line, &divided));
+    assert!(same_boundary_curve(&line, &reversed));
+    assert!(!same_boundary_curve(&line, &bowed));
+    assert!(!same_boundary_curve(&bowed, &line));
+    assert!(!same_boundary_curve(&line, &displaced));
+}
+
+#[test]
+fn shared_boundary_preserves_vertices_orientation_and_wire() {
+    let a = Vertex::new(Point3::new(0.0, 0.0, 0.0));
+    let b = Vertex::new(Point3::new(1.0, 0.0, 0.0));
+    let c = Vertex::new(Point3::new(0.0, 1.0, 0.0));
+    let edge = |x: &Vertex<Point3>, y: &Vertex<Point3>| Edge::new(x, y, PolylineCurve(vec![x.point(), y.point()]));
+    let ab = edge(&a, &b);
+    let mut loops = Loops(vec![BoundaryWire::new(vec![ab.clone(), edge(&b, &c), edge(&c, &a)].into(), ShapesOpStatus::Unknown)]);
+    let mirrors = loops.clone();
+    let again = edge(&a, &b);
+    let matched = matching_boundary(&loops, &mirrors, &again).unwrap();
+    assert_eq!(matched.0.id(), ab.id());
+    let disconnected = edge(&Vertex::new(a.point()), &Vertex::new(b.point()));
+    assert!(matching_boundary(&loops, &mirrors, &disconnected).is_none());
+    let bowed = Edge::new(&a, &b, PolylineCurve(vec![a.point(), Point3::new(0.5, 0.1, 0.0), b.point()]));
+    assert!(matching_boundary(&loops, &mirrors, &bowed).is_none());
+    assert_eq!(loops.classify_boundary(&matched.0, ShapesOpStatus::And), Some(true));
+    assert_eq!(loops.classify_boundary(&matched.0.inverse(), ShapesOpStatus::Or), Some(true));
+    assert_eq!(loops.classify_boundary(&matched.0.inverse(), ShapesOpStatus::And), None);
+    assert_eq!(loops.len(), 1);
+    assert_eq!(loops[0].len(), 3);
+    assert_eq!(loops[0].status(), ShapesOpStatus::And);
 }

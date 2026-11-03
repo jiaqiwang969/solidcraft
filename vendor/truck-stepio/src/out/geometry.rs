@@ -123,7 +123,7 @@ impl<P> DisplayByStep for BSplineCurve<P>
 where P: Copy + ConstStepLength + DisplayByStep
 {
     fn fmt(&self, idx: usize, f: &mut Formatter<'_>) -> Result {
-        let (knots, multi) = self.knot_vec().to_single_multi();
+        let (knots, multi) = exact_knot_multiplicities(self.knot_vec().as_slice());
         let control_points_instances = self
             .control_points()
             .iter()
@@ -154,7 +154,7 @@ where
     V::Point: ConstStepLength + DisplayByStep,
 {
     fn fmt(&self, idx: usize, f: &mut Formatter<'_>) -> Result {
-        let (knots, multi) = self.knot_vec().to_single_multi();
+        let (knots, multi) = exact_knot_multiplicities(self.knot_vec().as_slice());
         let control_points_instances = self
             .control_points()
             .iter()
@@ -597,8 +597,8 @@ where P: Copy + DisplayByStep
                 IndexSliceDisplay(idx + counter - slice.len() + 1..=idx + counter)
             })
             .collect::<Vec<_>>();
-        let (uknots, umulti) = self.uknot_vec().to_single_multi();
-        let (vknots, vmulti) = self.vknot_vec().to_single_multi();
+        let (uknots, umulti) = exact_knot_multiplicities(self.uknot_vec().as_slice());
+        let (vknots, vmulti) = exact_knot_multiplicities(self.vknot_vec().as_slice());
         f.write_fmt(format_args!(
             "#{idx} = B_SPLINE_SURFACE_WITH_KNOTS('', {u_degree}, {v_degree}, {control_points_list}, .UNSPECIFIED., .U., .U., .U., \
 {u_multiplicities}, {v_multiplicities}, {u_knots}, {v_knots}, .UNSPECIFIED.);\n{control_points_instances}",
@@ -651,8 +651,8 @@ where
             .iter()
             .map(|slice| SliceDisplay(slice))
             .collect::<Vec<_>>();
-        let (uknots, umulti) = self.uknot_vec().to_single_multi();
-        let (vknots, vmulti) = self.vknot_vec().to_single_multi();
+        let (uknots, umulti) = exact_knot_multiplicities(self.uknot_vec().as_slice());
+        let (vknots, vmulti) = exact_knot_multiplicities(self.vknot_vec().as_slice());
         f.write_fmt(format_args!(
             "#{idx} = (
     BOUNDED_SURFACE()
